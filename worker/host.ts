@@ -67,8 +67,9 @@ export function vaultHost(env: Env): VaultHost {
       return vaultPolicy(env);
     },
     internalSecret: requireSecret(env, "SESSION_SECRET"),
-    // Authentication is HTTP Basic (no cookies), so any origin may talk to /livesync.
-    allowedOrigins: "*",
+    // Library default: the Obsidian app origins plus this Worker's own origin.
+    // Echoing any Origin with credentials would let a page on another site read
+    // the vault with Basic credentials the browser has cached for /livesync.
     serverName: "livesync-workers",
   };
 }
