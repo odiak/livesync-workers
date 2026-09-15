@@ -1,0 +1,40 @@
+name: Publish to npm
+
+# Publishes packages/livesync-workers when a GitHub Release is published.
+# Uses npm trusted publishing (OIDC): configure the trusted publisher on
+# npmjs.com (repository odiak/livesync-workers, workflow publish.yml) first.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # prepare スクリプトで packages/livesync-workers の build も走る
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: Check that the release tag matches the package version
+        run: |
+          version="$(node -p "require('./packages/livesync-workers/package.json').version")"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
+
+      - run: npm publish --provenance --access public
+        working-directory: packages/livesync-workers
