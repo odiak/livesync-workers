@@ -74,6 +74,8 @@ In Self-hosted LiveSync's setup:
 
 E2EE must stay off: the server has to read note contents to index them and serve them over MCP. The status page at `/` shows these values (sign in with the admin password to see the username).
 
+Or skip the typing: after signing in on the status page, click **Generate Setup URI**. It produces an encrypted `obsidian://setuplivesync?settings=…` link plus a passphrase; choose **Use Setup URI** in the plugin's setup wizard and paste both. The URI is built in your browser (the server only supplies the connection details) and every click creates a new pair.
+
 ## Connect an MCP client
 
 Point the client at `https://<your-worker>.workers.dev/mcp` (Streamable HTTP). It will open a browser window; sign in with `ADMIN_PASSWORD` and choose which scopes to grant:

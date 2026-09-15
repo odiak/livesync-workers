@@ -10,7 +10,9 @@ import {
   vaultBindings,
   vaultFor,
   vaultHost,
+  vaultRef,
 } from "./host.js";
+import type { SetupConfig } from "./setup-uri.js";
 import {
   checkAdminPassword,
   checkStaticToken,
@@ -91,6 +93,18 @@ const appHandler: ExportedHandler<Env> = {
         }
       }
       return statusPage(env, data);
+    }
+
+    // Connection details for the browser-side Setup URI generator (admin only).
+    if (url.pathname === "/api/setup-config" && request.method === "GET") {
+      if (!(await isAdmin(request, env))) return new Response("Unauthorized", { status: 401 });
+      const config: SetupConfig = {
+        uri: `${url.origin}/livesync`,
+        username: liveSyncUsername(env),
+        password: requireSecret(env, "LIVESYNC_PASSWORD"),
+        database: vaultRef(env).databaseName,
+      };
+      return Response.json(config, { headers: { "Cache-Control": "no-store" } });
     }
 
     if (url.pathname === "/api/status" && request.method === "GET") {

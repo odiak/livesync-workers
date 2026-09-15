@@ -2,6 +2,7 @@ import { escapeHtml, htmlPage } from "livesync-workers/oauth";
 import type { VaultIndexStatus } from "livesync-workers";
 import { type Env } from "./env.js";
 import { vaultRef } from "./host.js";
+import { SETUP_URI_CLIENT_SCRIPT, SETUP_URI_IDS } from "./setup-uri.js";
 
 const TITLE = "livesync-workers";
 
@@ -54,6 +55,9 @@ export function statusPage(env: Env, data: StatusPageData): Response {
             }${data.index.fts?.rebuildAt ? ` · rebuild scheduled ${new Date(data.index.fts.rebuildAt).toISOString()}` : ""}</td></tr></table>`
           : ""
     : "";
+  const setupUriCard = data.admin
+    ? `<div class="card"><h2>Setup URI</h2><p class="muted">Instead of typing the values above, the plugin can import them: pick <strong>Use Setup URI</strong> in its setup wizard and paste the URI and the passphrase. Both are generated in your browser; the passphrase is only shown here, so copy them together. Each click makes a fresh pair.</p><p><button type="button" id="${SETUP_URI_IDS.button}">Generate Setup URI</button></p><p id="${SETUP_URI_IDS.error}" style="color:#b91c1c" hidden></p><div id="${SETUP_URI_IDS.result}" hidden><label for="${SETUP_URI_IDS.uri}">Setup URI</label><div style="display:flex;gap:8px"><input type="text" id="${SETUP_URI_IDS.uri}" readonly><button type="button" data-copy="${SETUP_URI_IDS.uri}">Copy</button></div><label for="${SETUP_URI_IDS.passphrase}">Passphrase</label><div style="display:flex;gap:8px"><input type="text" id="${SETUP_URI_IDS.passphrase}" readonly><button type="button" data-copy="${SETUP_URI_IDS.passphrase}">Copy</button></div></div></div><script>${SETUP_URI_CLIENT_SCRIPT}</script>`
+    : "";
   const adminBlock = data.admin
     ? `<p class="muted">Signed in as admin · <form method="post" action="/logout" style="display:inline"><button type="submit" style="background:#6b7280;padding:4px 12px">Sign out</button></form></p>`
     : `<p><a class="button" href="/login?next=%2F">Sign in as admin</a> <span class="muted">to see the username and index status.</span></p>`;
@@ -69,6 +73,7 @@ export function statusPage(env: Env, data: StatusPageData): Response {
 <tr><th>Password</th><td><span class="muted">the <code>LIVESYNC_PASSWORD</code> secret</span></td></tr>
 <tr><th>End-to-End Encryption</th><td><strong>off</strong> (the server must read notes to index them)</td></tr>
 </table></div>
+${setupUriCard}
 <div class="card"><h2>MCP</h2><table>
 <tr><th>Endpoint</th><td><code>${escapeHtml(data.origin)}/mcp</code></td></tr>
 <tr><th>Auth</th><td>OAuth (sign in with the admin password when the client asks)${env.MCP_STATIC_TOKEN ? ", or <code>Authorization: Bearer &lt;MCP_STATIC_TOKEN&gt;</code> (read-only unless <code>MCP_STATIC_TOKEN_SCOPES</code> adds more)" : ""}</td></tr>
