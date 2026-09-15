@@ -562,11 +562,14 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       // docs.updated_seq the document's latest change.
       const touched = new Set<string>();
       this.ctx.storage.transactionSync(() => {
+        // Rows whose parent is missing, or that were stored without one
+        // (a short history) although they are not first-generation.
         const orphans = sql
           .exec<{ id: string; rev: string; seq: number; rev_history: string | null }>(
             `SELECT r.id, r.rev, r.seq, r.rev_history FROM revs r
-             WHERE r.parent_rev IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM revs p WHERE p.id = r.id AND p.rev = r.parent_rev)`,
+             WHERE (r.parent_rev IS NULL AND r.gen > 1)
+                OR (r.parent_rev IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM revs p WHERE p.id = r.id AND p.rev = r.parent_rev))`,
           )
           .toArray();
         for (const orphan of orphans) {
@@ -578,7 +581,14 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
           }
           if (!revisions) continue;
           const ancestors = ancestorsFromRevisions({ _rev: orphan.rev, _revisions: revisions });
-          this.insertAncestorStubs(orphan.id, ancestors, orphan.seq);
+          if (ancestors.length === 0) continue;
+          sql.exec(
+            `UPDATE revs SET parent_rev = ? WHERE id = ? AND rev = ? AND parent_rev IS NULL`,
+            ancestors[0],
+            orphan.id,
+            orphan.rev,
+          );
+          this.linkAncestors(orphan.id, ancestors, orphan.seq);
           touched.add(orphan.id);
         }
         for (const id of touched) this.recalculateWinner(id);
@@ -1521,13 +1531,30 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   /**
-   * Records ancestors the replicator skipped (nearest first) as body-less
-   * stub revisions so the tree stays connected. Stops at the first ancestor
-   * already stored, whose own chain is then already in place.
+   * Connects a revision's ancestors (nearest first) into the stored tree:
+   * ancestors the replicator skipped become body-less stubs, and an
+   * ancestor stored earlier with a shorter history gets its missing parent
+   * filled in. Stops once an ancestor's parent link is already in place,
+   * since the chain above it was connected when that row was written.
    */
-  private insertAncestorStubs(id: string, ancestors: string[], seq: number): void {
+  private linkAncestors(id: string, ancestors: string[], seq: number): void {
     for (const [index, rev] of ancestors.entries()) {
-      if (this.rawRevRow(id, rev)) break;
+      const parentRev = ancestors[index + 1] ?? null;
+      const existing = this.rawRevRow(id, rev);
+      if (existing) {
+        if (existing.parent_rev) {
+          if (this.rawRevRow(id, existing.parent_rev)) break;
+          continue;
+        }
+        if (!parentRev) break;
+        this.ctx.storage.sql.exec(
+          `UPDATE revs SET parent_rev = ? WHERE id = ? AND rev = ?`,
+          parentRev,
+          id,
+          rev,
+        );
+        continue;
+      }
       const parsed = parseRev(rev);
       if (!parsed) break;
       this.ctx.storage.sql.exec(
@@ -1537,7 +1564,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         id,
         rev,
         parsed.gen,
-        ancestors[index + 1] ?? null,
+        parentRev,
         seq,
       );
     }
@@ -1557,7 +1584,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }): void {
     const chunks = splitRevisionBody(row.body);
     this.ctx.storage.transactionSync(() => {
-      if (row.ancestors) this.insertAncestorStubs(row.id, row.ancestors, row.seq);
+      if (row.ancestors) this.linkAncestors(row.id, row.ancestors, row.seq);
       this.ctx.storage.sql.exec(
         `INSERT INTO revs
            (id, rev, gen, parent_rev, body, body_chunked, body_available, deleted, seq, rev_history)

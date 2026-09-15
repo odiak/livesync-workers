@@ -406,11 +406,15 @@ describe("LiveSync revision body chunking", () => {
       { _id: "n", _rev: "3-c", _revisions: { start: 3, ids: ["c", "b", "a"] }, v: 3 },
       { _id: "n", _rev: "4-d", _revisions: { start: 4, ids: ["d", "c", "b", "a"] }, _deleted: true },
       { _id: "other", _rev: "1-o", _revisions: { start: 1, ids: ["o"] } },
+      { _id: "short", _rev: "1-s", _revisions: { start: 1, ids: ["s"] } },
+      { _id: "short", _rev: "2-t", _revisions: { start: 2, ids: ["t", "s"] } },
     ]);
     // Rewind to what schema 2 stored: no stub for 2-b, so 1-a was a leaf and
-    // won over the tombstone; updated_seq was the winner's own seq.
+    // won over the tombstone; updated_seq was the winner's own seq. "short"
+    // stands for a revision stored from a truncated history without a parent.
     database.exec(`DELETE FROM revs WHERE id = 'n' AND rev = '2-b'`);
     database.exec(`UPDATE docs SET winning_rev = '1-a', deleted = 0, updated_seq = 1 WHERE id = 'n'`);
+    database.exec(`UPDATE revs SET parent_rev = NULL WHERE id = 'short' AND rev = '2-t'`);
     database.exec(`DELETE FROM _sql_schema_migrations WHERE id = 3`);
 
     const reopened = new TestVaultDO({ storage } as unknown as DurableObjectState, testEnv());
@@ -427,7 +431,13 @@ describe("LiveSync revision body chunking", () => {
       .toEqual([
         { id: "n", winning_rev: "4-d", deleted: 1, updated_seq: 3 },
         { id: "other", winning_rev: "1-o", deleted: 0, updated_seq: 4 },
+        { id: "short", winning_rev: "2-t", deleted: 0, updated_seq: 6 },
       ]);
+    expect(database.prepare(`SELECT parent_rev FROM revs WHERE id = 'short' AND rev = '2-t'`).get())
+      .toEqual({ parent_rev: "1-s" });
+    await expect((await reopened.fetch(
+      new Request("https://db/short?conflicts=true"),
+    )).json()).resolves.toEqual({ _id: "short", _rev: "2-t" });
     expect((await reopened.fetch(new Request("https://db/n"))).status).toBe(404);
   });
 });
@@ -802,6 +812,37 @@ describe("LiveSync CouchDB compatibility", () => {
     expect((await durableObject.fetch(new Request("https://db/n"))).status).toBe(404);
     const all = await (await durableObject.fetch(new Request("https://db/_all_docs"))).json() as { rows: unknown[] };
     expect(all.rows).toEqual([]);
+  });
+
+  it("fills in the parent of an ancestor that was stored with a short history", async () => {
+    const { durableObject, database } = await liveSyncDbCreated();
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "1-a", _revisions: { start: 1, ids: ["a"] }, v: 1 },
+      { _id: "n", _rev: "2-b", _revisions: { start: 2, ids: ["b"] }, v: 2 },
+    ]);
+    // 2-b arrived without its parent, so 1-a looks like a separate branch...
+    await expect((await durableObject.fetch(
+      new Request("https://db/n?conflicts=true"),
+    )).json()).resolves.toMatchObject({ _rev: "2-b", _conflicts: ["1-a"] });
+
+    // ...until a descendant brings the full history.
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "3-c", _revisions: { start: 3, ids: ["c", "b", "a"] }, v: 3 },
+    ]);
+    expect(database.prepare(`SELECT rev, parent_rev FROM revs WHERE id = 'n' ORDER BY gen`).all())
+      .toEqual([
+        { rev: "1-a", parent_rev: null },
+        { rev: "2-b", parent_rev: "1-a" },
+        { rev: "3-c", parent_rev: "2-b" },
+      ]);
+    await expect((await durableObject.fetch(
+      new Request("https://db/n?conflicts=true"),
+    )).json()).resolves.toEqual({ _id: "n", _rev: "3-c", v: 3 });
+
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "4-d", _revisions: { start: 4, ids: ["d", "c", "b", "a"] }, _deleted: true },
+    ]);
+    expect((await durableObject.fetch(new Request("https://db/n"))).status).toBe(404);
   });
 
   it("lets a losing leaf be deleted to resolve a conflict", async () => {
