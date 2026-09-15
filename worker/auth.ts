@@ -1,0 +1,59 @@
+import { constantTimeEquals } from "livesync-workers";
+import type { Env } from "./env.js";
+import { requireSecret } from "./host.js";
+
+export const SESSION_COOKIE = "ls_admin";
+const SESSION_TTL_SECONDS = 60 * 60 * 12;
+const enc = new TextEncoder();
+
+async function hmacHex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function cookieValue(header: string | null, name: string): string | undefined {
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name && rest.length) return decodeURIComponent(rest.join("="));
+  }
+  return undefined;
+}
+
+export async function createSessionCookie(env: Env): Promise<string> {
+  const exp = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
+  const sig = await hmacHex(requireSecret(env, "SESSION_SECRET"), `admin:${exp}`);
+  return `${SESSION_COOKIE}=${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}`;
+}
+
+export const clearSessionCookie = `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+
+export async function isAdmin(request: Request, env: Env): Promise<boolean> {
+  const value = cookieValue(request.headers.get("Cookie"), SESSION_COOKIE);
+  if (!value || !env.SESSION_SECRET) return false;
+  const [expRaw, sig] = value.split(".");
+  const exp = Number(expRaw);
+  if (!Number.isFinite(exp) || exp * 1000 < Date.now() || !sig) return false;
+  const expected = await hmacHex(env.SESSION_SECRET, `admin:${exp}`);
+  return constantTimeEquals(sig, expected);
+}
+
+export function checkAdminPassword(env: Env, password: string): boolean {
+  const expected = env.ADMIN_PASSWORD;
+  return !!expected && constantTimeEquals(password, expected);
+}
+
+export function checkStaticToken(env: Env, request: Request): boolean {
+  const token = env.MCP_STATIC_TOKEN;
+  if (!token) return false;
+  const header = request.headers.get("Authorization") ?? "";
+  if (!header.startsWith("Bearer ")) return false;
+  return constantTimeEquals(header.slice("Bearer ".length), token);
+}

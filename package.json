@@ -1,0 +1,32 @@
+{
+  "name": "livesync-workers-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Single-tenant deployment of livesync-workers: LiveSync backend + MCP on Cloudflare Workers",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w livesync-workers",
+    "deploy": "npm run build && wrangler deploy",
+    "dev": "npm run build && wrangler dev",
+    "setup": "node scripts/setup.mjs",
+    "typecheck": "npm run typecheck -w livesync-workers && tsc -p tsconfig.json --noEmit",
+    "test": "npm test -w livesync-workers",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.4.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "agents": "0.12.0",
+    "ai": "6.0.172",
+    "livesync-workers": "0.1.0",
+    "zod": "4.4.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260501.1",
+    "typescript": "6.0.3",
+    "wrangler": "4.87.0"
+  }
+}

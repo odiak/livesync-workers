@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "livesync-workers",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-04-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // CouchDB database name the LiveSync plugin connects to.
+    "LIVESYNC_DATABASE": "vault",
+    // IANA time zone used to resolve "today" for daily notes (e.g. "Asia/Tokyo").
+    "VAULT_TIMEZONE": "UTC",
+    // Comma-separated vault folders to leave out of search indexes.
+    "VAULT_EXCLUDED_FOLDERS": "",
+    // Extra CORS origins (comma-separated) besides the Obsidian defaults.
+    "APP_ORIGINS": "",
+  },
+  "ai": { "binding": "AI" },
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "r2_buckets": [{ "binding": "FTS_BUCKET", "bucket_name": "livesync-fts" }],
+  // Create with: wrangler vectorize create livesync-notes --dimensions=768 --metric=cosine
+  "vectorize": [{ "binding": "VECTORIZE", "index_name": "livesync-notes" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "VAULT_DB", "class_name": "VaultDO" },
+      { "name": "MCP_OBJECT", "class_name": "VaultMCP" },
+    ],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VaultDO", "VaultMCP"] }],
+  "observability": { "enabled": true },
+}

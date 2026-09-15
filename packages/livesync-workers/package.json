@@ -1,0 +1,69 @@
+{
+  "name": "livesync-workers",
+  "version": "0.1.0",
+  "description": "Self-hosted LiveSync-compatible backend for Obsidian with search and MCP, for Cloudflare Workers",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/odiak/livesync-workers.git",
+    "directory": "packages/livesync-workers"
+  },
+  "homepage": "https://github.com/odiak/livesync-workers#readme",
+  "keywords": [
+    "obsidian",
+    "livesync",
+    "couchdb",
+    "cloudflare-workers",
+    "durable-objects",
+    "mcp"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "default": "./dist/mcp/index.js"
+    },
+    "./oauth": {
+      "types": "./dist/oauth/index.d.ts",
+      "default": "./dist/oauth/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@cloudflare/workers-oauth-provider": ">=0.2.0",
+    "@modelcontextprotocol/sdk": ">=1.10.0",
+    "zod": ">=3.23.0"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/workers-oauth-provider": {
+      "optional": true
+    },
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/workers-oauth-provider": "0.4.0",
+    "@cloudflare/workers-types": "4.20260501.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@types/node": "24.12.2",
+    "typescript": "6.0.3",
+    "vitest": "4.1.5",
+    "zod": "4.4.1"
+  }
+}

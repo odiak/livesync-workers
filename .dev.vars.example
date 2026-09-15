@@ -1,0 +1,13 @@
+# Username and password the Obsidian LiveSync plugin will use (Remote Type: CouchDB).
+# Pick anything; long random values are best.
+LIVESYNC_USERNAME=obsidian
+LIVESYNC_PASSWORD=change-me-to-a-long-random-password
+
+# Password for the admin login (used when authorizing MCP clients at /authorize).
+ADMIN_PASSWORD=change-me-too
+
+# Random secret used to sign admin session cookies and internal requests (32+ random chars).
+SESSION_SECRET=change-me-to-a-random-string
+
+# Optional: a static bearer token for MCP clients that cannot do OAuth (leave empty to disable).
+MCP_STATIC_TOKEN=
