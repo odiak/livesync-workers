@@ -9,7 +9,7 @@ Sync your vault from Obsidian the way you would to CouchDB, then let AI assistan
 > This is an independent project. It is not affiliated with the Self-hosted LiveSync plugin or its author.
 > It implements the subset of the CouchDB API that the plugin uses, not CouchDB in general.
 
-Built for [Kuro](https://github.com/odiak/kuro). Available to everyone.
+Built for [Kuro](https://usekuro.app). Available to everyone.
 
 ## What you get
 
