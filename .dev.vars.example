@@ -11,8 +11,9 @@ ADMIN_PASSWORD=
 # Random secret that signs admin session cookies and internal requests (32+ random chars).
 SESSION_SECRET=
 
-# Optional secrets are not listed here, because every entry in this file becomes a
-# required field in the Deploy to Cloudflare form. Add them with `wrangler secret put`
-# or in the dashboard when you need them:
-#   MCP_STATIC_TOKEN: a static bearer token for MCP clients that cannot do OAuth.
-#     It grants vault:read only; widen it with the MCP_STATIC_TOKEN_SCOPES variable.
+# Optional: a static bearer token for MCP clients that cannot do OAuth.
+# It grants vault:read only; widen it with the MCP_STATIC_TOKEN_SCOPES variable.
+# Kept commented out because every active entry in this file becomes a required
+# field in the Deploy to Cloudflare form. Uncomment it for local dev, or add the
+# secret with `wrangler secret put MCP_STATIC_TOKEN` / in the dashboard.
+# MCP_STATIC_TOKEN=
