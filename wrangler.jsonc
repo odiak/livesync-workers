@@ -9,9 +9,9 @@
     "LIVESYNC_DATABASE": "vault",
     // Username the LiveSync plugin logs in with (the password is the LIVESYNC_PASSWORD secret).
     "LIVESYNC_USERNAME": "obsidian",
-    // Comma-separated vault folders to leave out of search indexes.
-    "VAULT_EXCLUDED_FOLDERS": "",
-    // Optional, add in the dashboard if needed:
+    // Optional variables are left out because every entry here becomes a required
+    // field in the Deploy to Cloudflare form. Add them in the dashboard (or here) if needed:
+    //   VAULT_EXCLUDED_FOLDERS: comma-separated vault folders to leave out of search indexes.
     //   MCP_STATIC_TOKEN_SCOPES: extra scopes for MCP_STATIC_TOKEN (vault:append,vault:write).
   },
   "ai": { "binding": "AI" },

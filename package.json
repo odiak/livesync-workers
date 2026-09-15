@@ -49,9 +49,6 @@
       "LIVESYNC_USERNAME": {
         "description": "Username you will enter in the Obsidian LiveSync plugin."
       },
-      "VAULT_EXCLUDED_FOLDERS": {
-        "description": "Optional. Comma-separated folders to leave out of the search indexes (they stay readable), e.g. `Templates,Archive`."
-      },
       "LIVESYNC_PASSWORD": {
         "description": "Password you will enter in the Obsidian LiveSync plugin. Pick a long random string (e.g. `openssl rand -hex 24`)."
       },
