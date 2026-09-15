@@ -60,9 +60,6 @@
       },
       "SESSION_SECRET": {
         "description": "Signs admin session cookies and internal requests. Generate with `openssl rand -hex 32`."
-      },
-      "MCP_STATIC_TOKEN": {
-        "description": "Optional. Leave empty unless you have an MCP client that cannot do OAuth; it then sends this as a Bearer token (read-only by default)."
       }
     }
   }

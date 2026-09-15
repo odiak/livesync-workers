@@ -34,7 +34,6 @@ Notes written through MCP are regular LiveSync revisions, so they show up in Obs
    - `LIVESYNC_PASSWORD`: what the Obsidian plugin will log in with (the username is the `LIVESYNC_USERNAME` variable, `obsidian` by default).
    - `ADMIN_PASSWORD`: for the admin login on the status page and when authorizing MCP clients.
    - `SESSION_SECRET`: any long random string, e.g. `openssl rand -hex 32`.
-   - `MCP_STATIC_TOKEN` (optional): leave empty unless you need a non-OAuth client.
 4. Deploy. Durable Objects, KV, R2, Workers AI and Vectorize are created for you.
 5. Open your Worker's URL. The page shows the LiveSync URI, database name and MCP URL, and warns if a secret is still missing.
 
@@ -85,7 +84,7 @@ Point the client at `https://<your-worker>.workers.dev/mcp` (Streamable HTTP). I
 | `vault:append` | off | appendToDailyNote, appendToNote |
 | `vault:write` | off | writeNote |
 
-Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>` instead when that secret is set. The token grants `vault:read` only; add `vault:append` and/or `vault:write` through the `MCP_STATIC_TOKEN_SCOPES` variable. Tools apply the same scope checks as for OAuth grants.
+Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>` instead once you add that secret (`wrangler secret put MCP_STATIC_TOKEN`, or in the dashboard under Settings → Variables and Secrets). The token grants `vault:read` only; add `vault:append` and/or `vault:write` through the `MCP_STATIC_TOKEN_SCOPES` variable. Tools apply the same scope checks as for OAuth grants.
 
 ## Configuration
 
@@ -98,7 +97,7 @@ Variables (in `wrangler.jsonc` `vars`, editable in the dashboard):
 | `VAULT_EXCLUDED_FOLDERS` | (empty) | Comma-separated folders left out of the search indexes (still readable) |
 | `MCP_STATIC_TOKEN_SCOPES` | (not set) | Extra scopes for the static token, e.g. `vault:append,vault:write`. Add it in the dashboard when needed |
 
-Secrets: `LIVESYNC_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, optional `MCP_STATIC_TOKEN`. Empty values and `change-me…` placeholders count as unset; the status page tells you which ones are missing.
+Secrets: `LIVESYNC_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, and optionally `MCP_STATIC_TOKEN` (not in `.dev.vars.example`, since every entry there becomes a required field in the Deploy form). Empty values and `change-me…` placeholders count as unset; the status page tells you which ones are missing.
 
 `/livesync` accepts requests from any origin (authentication is HTTP Basic, so there is nothing for a cross-site page to hijack). Daily notes: `appendToDailyNote` takes the date from the client; without one it falls back to today in UTC.
 
