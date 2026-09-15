@@ -25,9 +25,14 @@ const liveSyncDefaultOrigins = [
   "http://localhost",
 ] as const;
 
+function allowsAnyOrigin(host: VaultHost): boolean {
+  return host.allowedOrigins === "*";
+}
+
 function allowedOrigins(host: VaultHost, request: Request): Set<string> {
   const origins = new Set<string>([...liveSyncDefaultOrigins, new URL(request.url).origin]);
-  for (const origin of host.allowedOrigins ?? []) {
+  const extra = host.allowedOrigins === "*" ? [] : (host.allowedOrigins ?? []);
+  for (const origin of extra) {
     const trimmed = origin.trim();
     if (trimmed) origins.add(trimmed);
   }
@@ -44,7 +49,7 @@ function corsHeaders(request: Request, host: VaultHost): HeadersInit | null {
     Vary: "Origin",
   };
   if (!origin) return { ...base, "Access-Control-Allow-Origin": "*" };
-  if (!allowedOrigins(host, request).has(origin)) return null;
+  if (!allowsAnyOrigin(host) && !allowedOrigins(host, request).has(origin)) return null;
   return {
     ...base,
     "Access-Control-Allow-Origin": origin,
@@ -129,7 +134,7 @@ function configObject(host: VaultHost, request: Request) {
     },
     cors: {
       credentials: "true",
-      origins: [...allowedOrigins(host, request)].join(","),
+      origins: allowsAnyOrigin(host) ? "*" : [...allowedOrigins(host, request)].join(","),
       headers: "authorization,content-type,accept,origin,referer,x-couch-full-commit",
       methods: "GET,HEAD,POST,PUT,DELETE,OPTIONS",
     },

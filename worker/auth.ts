@@ -1,6 +1,6 @@
 import { constantTimeEquals } from "livesync-workers";
 import type { Env } from "./env.js";
-import { requireSecret } from "./host.js";
+import { requireSecret, secretValue } from "./host.js";
 
 export const SESSION_COOKIE = "ls_admin";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
@@ -37,16 +37,17 @@ export const clearSessionCookie = `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure;
 
 export async function isAdmin(request: Request, env: Env): Promise<boolean> {
   const value = cookieValue(request.headers.get("Cookie"), SESSION_COOKIE);
-  if (!value || !env.SESSION_SECRET) return false;
+  const secret = secretValue(env, "SESSION_SECRET");
+  if (!value || !secret) return false;
   const [expRaw, sig] = value.split(".");
   const exp = Number(expRaw);
   if (!Number.isFinite(exp) || exp * 1000 < Date.now() || !sig) return false;
-  const expected = await hmacHex(env.SESSION_SECRET, `admin:${exp}`);
+  const expected = await hmacHex(secret, `admin:${exp}`);
   return constantTimeEquals(sig, expected);
 }
 
 export function checkAdminPassword(env: Env, password: string): boolean {
-  const expected = env.ADMIN_PASSWORD;
+  const expected = secretValue(env, "ADMIN_PASSWORD");
   return !!expected && constantTimeEquals(password, expected);
 }
 

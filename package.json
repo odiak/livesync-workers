@@ -9,7 +9,7 @@
   ],
   "scripts": {
     "build": "npm run build -w livesync-workers",
-    "deploy": "npm run build && wrangler deploy",
+    "deploy": "wrangler deploy",
     "dev": "npm run build && wrangler dev",
     "setup": "node scripts/setup.mjs",
     "typecheck": "npm run typecheck -w livesync-workers && tsc -p tsconfig.json --noEmit",
@@ -28,5 +28,42 @@
     "@cloudflare/workers-types": "4.20260501.1",
     "typescript": "6.0.3",
     "wrangler": "4.87.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "VECTORIZE": {
+        "description": "Semantic search index. Enter **768** dimensions and **cosine** metric: the embedding model (Workers AI `@cf/google/embeddinggemma-300m`) requires them."
+      },
+      "FTS_BUCKET": {
+        "description": "Stores the full-text search index. Any bucket name works."
+      },
+      "OAUTH_KV": {
+        "description": "Stores MCP OAuth clients and tokens. Any namespace name works."
+      },
+      "AI": {
+        "description": "Workers AI, used to compute note embeddings."
+      },
+      "LIVESYNC_DATABASE": {
+        "description": "Database name you will enter in the Obsidian LiveSync plugin. Keep `vault` unless you have a reason."
+      },
+      "LIVESYNC_USERNAME": {
+        "description": "Username you will enter in the Obsidian LiveSync plugin."
+      },
+      "VAULT_EXCLUDED_FOLDERS": {
+        "description": "Optional. Comma-separated folders to leave out of the search indexes (they stay readable), e.g. `Templates,Archive`."
+      },
+      "LIVESYNC_PASSWORD": {
+        "description": "Password you will enter in the Obsidian LiveSync plugin. Pick a long random string (e.g. `openssl rand -hex 24`)."
+      },
+      "ADMIN_PASSWORD": {
+        "description": "Password for the admin login on the status page and when authorizing MCP clients."
+      },
+      "SESSION_SECRET": {
+        "description": "Signs admin session cookies and internal requests. Generate with `openssl rand -hex 32`."
+      },
+      "MCP_STATIC_TOKEN": {
+        "description": "Optional. Leave empty unless you have an MCP client that cannot do OAuth; it then sends this as a Bearer token (read-only by default)."
+      }
+    }
   }
 }

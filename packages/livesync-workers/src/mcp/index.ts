@@ -237,7 +237,9 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
         .string()
         .regex(/^\d{4}-\d{2}-\d{2}$/)
         .optional()
-        .describe("Daily note date (YYYY-MM-DD). Defaults to today in the vault's time zone."),
+        .describe(
+          "Daily note date (YYYY-MM-DD). Pass today's date in the user's local time zone; if omitted, today in the vault's configured time zone (see vaultStatus) is used.",
+        ),
     },
     async ({ text, date }) => {
       const vault = await readyVault("vault:append");

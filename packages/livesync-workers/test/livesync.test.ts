@@ -242,6 +242,23 @@ describe("LiveSync worker routing", () => {
     expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
     expect(stub.fetch).not.toHaveBeenCalled();
   });
+
+  it("echoes any origin when the host allows all origins", async () => {
+    const stub = { fetch: vi.fn() };
+    const { env } = await envWithStub(stub);
+    const response = await handleLiveSyncRequest(
+      new Request("https://kuro.example/livesync/vault", {
+        method: "OPTIONS",
+        headers: { Origin: "https://anything.example" },
+      }),
+      { ...env, host: { ...env.host, allowedOrigins: "*" } },
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("https://anything.example");
+    expect(response.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+    expect(stub.fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("LiveSync revision body chunking", () => {

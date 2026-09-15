@@ -4,7 +4,9 @@ import { createVaultOAuthProvider } from "livesync-workers/oauth";
 import type { Env } from "./env.js";
 import {
   ConfigError,
+  liveSyncUsername,
   requireSecret,
+  secretValue,
   vaultBindings,
   vaultFor,
   vaultHost,
@@ -73,13 +75,13 @@ const appHandler: ExportedHandler<Env> = {
     if (url.pathname === "/" && request.method === "GET") {
       const admin = await isAdmin(request, env);
       const configured = {
-        livesync: !!(env.LIVESYNC_USERNAME && env.LIVESYNC_PASSWORD),
-        admin: !!env.ADMIN_PASSWORD,
-        session: !!env.SESSION_SECRET,
+        livesync: !!secretValue(env, "LIVESYNC_PASSWORD"),
+        admin: !!secretValue(env, "ADMIN_PASSWORD"),
+        session: !!secretValue(env, "SESSION_SECRET"),
       };
       const data: Parameters<typeof statusPage>[1] = { origin: url.origin, admin, configured };
       if (admin) {
-        data.username = env.LIVESYNC_USERNAME;
+        data.username = liveSyncUsername(env);
         try {
           const vault = vaultFor(env);
           data.dbExists = await vault.exists();

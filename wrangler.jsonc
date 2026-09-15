@@ -7,14 +7,12 @@
   "vars": {
     // CouchDB database name the LiveSync plugin connects to.
     "LIVESYNC_DATABASE": "vault",
-    // IANA time zone used to resolve "today" for daily notes (e.g. "Asia/Tokyo").
-    "VAULT_TIMEZONE": "UTC",
+    // Username the LiveSync plugin logs in with (the password is the LIVESYNC_PASSWORD secret).
+    "LIVESYNC_USERNAME": "obsidian",
     // Comma-separated vault folders to leave out of search indexes.
     "VAULT_EXCLUDED_FOLDERS": "",
-    // Extra CORS origins (comma-separated) besides the Obsidian defaults.
-    "APP_ORIGINS": "",
-    // Scopes granted to MCP_STATIC_TOKEN besides vault:read (comma-separated: vault:append,vault:write).
-    "MCP_STATIC_TOKEN_SCOPES": "",
+    // Optional, add in the dashboard if needed:
+    //   MCP_STATIC_TOKEN_SCOPES: extra scopes for MCP_STATIC_TOKEN (vault:append,vault:write).
   },
   "ai": { "binding": "AI" },
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],

@@ -34,8 +34,11 @@ export interface VaultHost {
   loadVaultPolicy(ref: VaultRef): Promise<VaultPolicy>;
   /** Shared secret protecting the Worker → Durable Object internal API. */
   internalSecret: string;
-  /** Extra CORS origins besides the Obsidian defaults and the Worker's own origin. */
-  allowedOrigins?: string[];
+  /**
+   * Extra CORS origins besides the Obsidian defaults and the Worker's own origin.
+   * "*" allows any origin (the request's Origin is echoed back, since LiveSync sends credentials).
+   */
+  allowedOrigins?: string[] | "*";
   /** Vendor name reported by the CouchDB welcome endpoint and the auth realm. */
   serverName?: string;
 }

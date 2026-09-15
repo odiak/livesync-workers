@@ -28,15 +28,15 @@ Notes written through MCP are regular LiveSync revisions, so they show up in Obs
 
 ### Option A: Deploy to Cloudflare button
 
-1. Click the button above. Cloudflare clones this repository into your GitHub/GitLab account and connects it to Workers Builds.
-2. Fill in the secrets it asks for (they come from [`.dev.vars.example`](.dev.vars.example)):
-   - `LIVESYNC_USERNAME`, `LIVESYNC_PASSWORD`: what the Obsidian plugin will log in with.
-   - `ADMIN_PASSWORD`: for the admin login used when authorizing MCP clients.
-   - `SESSION_SECRET`: any long random string.
+1. Click the button above. Cloudflare clones this repository into your GitHub/GitLab account and connects it to Workers Builds. Tick **Create private Git repository** if you would rather not publish your copy (it contains no secrets either way).
+2. For the **Vectorize index**, enter **768** dimensions and **cosine** metric (the embedding model requires them). Keep the other resources as proposed.
+3. Fill in the secrets. The fields start empty; the form shows what each one is for.
+   - `LIVESYNC_PASSWORD`: what the Obsidian plugin will log in with (the username is the `LIVESYNC_USERNAME` variable, `obsidian` by default).
+   - `ADMIN_PASSWORD`: for the admin login on the status page and when authorizing MCP clients.
+   - `SESSION_SECRET`: any long random string, e.g. `openssl rand -hex 32`.
    - `MCP_STATIC_TOKEN` (optional): leave empty unless you need a non-OAuth client.
-3. When asked about the **Vectorize index**, enter **768** dimensions and **cosine** metric (the embedding model requires it).
 4. Deploy. Durable Objects, KV, R2, Workers AI and Vectorize are created for you.
-5. Open your Worker's URL. The page shows the LiveSync URI, database name and MCP URL.
+5. Open your Worker's URL. The page shows the LiveSync URI, database name and MCP URL, and warns if a secret is still missing.
 
 Later pushes to your copy of the repository redeploy automatically.
 
@@ -47,12 +47,13 @@ git clone https://github.com/odiak/livesync-workers.git
 cd livesync-workers
 npm install
 npm run setup            # creates the Vectorize index and R2 bucket
-npx wrangler secret put LIVESYNC_USERNAME
 npx wrangler secret put LIVESYNC_PASSWORD
 npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put SESSION_SECRET
-npm run deploy
+npm run build && npm run deploy
 ```
+
+`build` and `deploy` are separate scripts on purpose: Workers Builds runs `build` and then either `deploy` (production) or `wrangler preview` (preview builds).
 
 The KV namespace for OAuth is provisioned automatically on the first deploy.
 
@@ -69,7 +70,7 @@ In Self-hosted LiveSync's setup:
 | Remote Type | CouchDB |
 | URI | `https://<your-worker>.workers.dev/livesync` |
 | Database name | `vault` (the `LIVESYNC_DATABASE` var) |
-| Username / Password | your `LIVESYNC_USERNAME` / `LIVESYNC_PASSWORD` |
+| Username / Password | the `LIVESYNC_USERNAME` variable (`obsidian` by default) / your `LIVESYNC_PASSWORD` secret |
 | End-to-End Encryption | **off** |
 
 E2EE must stay off: the server has to read note contents to index them and serve them over MCP. The status page at `/` shows these values (sign in with the admin password to see the username).
@@ -93,12 +94,13 @@ Variables (in `wrangler.jsonc` `vars`, editable in the dashboard):
 | Variable | Default | Meaning |
 |---|---|---|
 | `LIVESYNC_DATABASE` | `vault` | CouchDB database name the plugin connects to |
-| `VAULT_TIMEZONE` | `UTC` | IANA time zone used to pick "today" for daily notes, e.g. `Asia/Tokyo` |
+| `LIVESYNC_USERNAME` | `obsidian` | Username the plugin logs in with |
 | `VAULT_EXCLUDED_FOLDERS` | (empty) | Comma-separated folders left out of the search indexes (still readable) |
-| `APP_ORIGINS` | (empty) | Extra CORS origins besides the Obsidian defaults |
-| `MCP_STATIC_TOKEN_SCOPES` | (empty) | Extra scopes for the static token, e.g. `vault:append,vault:write` |
+| `MCP_STATIC_TOKEN_SCOPES` | (not set) | Extra scopes for the static token, e.g. `vault:append,vault:write`. Add it in the dashboard when needed |
 
-Secrets: `LIVESYNC_USERNAME`, `LIVESYNC_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, optional `MCP_STATIC_TOKEN`.
+Secrets: `LIVESYNC_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, optional `MCP_STATIC_TOKEN`. Empty values and `change-me…` placeholders count as unset; the status page tells you which ones are missing.
+
+`/livesync` accepts requests from any origin (authentication is HTTP Basic, so there is nothing for a cross-site page to hijack). Daily notes: `appendToDailyNote` takes the date from the client; without one it falls back to today in UTC.
 
 ## How it works
 

@@ -32,10 +32,9 @@ Done. The KV namespace for OAuth (OAUTH_KV) is provisioned automatically on firs
 
 Next:
   1. Set secrets (see .dev.vars.example):
-       npx wrangler secret put LIVESYNC_USERNAME
        npx wrangler secret put LIVESYNC_PASSWORD
        npx wrangler secret put ADMIN_PASSWORD
        npx wrangler secret put SESSION_SECRET
   2. Deploy:
-       npm run deploy
+       npm run build && npm run deploy
 `);

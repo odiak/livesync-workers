@@ -1,7 +1,7 @@
 import { escapeHtml, htmlPage } from "livesync-workers/oauth";
 import type { VaultIndexStatus } from "livesync-workers";
 import { type Env } from "./env.js";
-import { vaultPolicy, vaultRef } from "./host.js";
+import { vaultRef } from "./host.js";
 
 const TITLE = "livesync-workers";
 
@@ -29,18 +29,17 @@ export type StatusPageData = {
 
 export function statusPage(env: Env, data: StatusPageData): Response {
   const ref = vaultRef(env);
-  const policy = vaultPolicy(env);
   const missing = Object.entries(data.configured)
     .filter(([, ok]) => !ok)
     .map(
       ([key]) =>
-        ({ livesync: "LIVESYNC_USERNAME / LIVESYNC_PASSWORD", admin: "ADMIN_PASSWORD", session: "SESSION_SECRET" })[
+        ({ livesync: "LIVESYNC_PASSWORD", admin: "ADMIN_PASSWORD", session: "SESSION_SECRET" })[
           key
         ] ?? key,
     );
   const warn =
     missing.length > 0
-      ? `<div class="card" style="border-color:#f59e0b"><h2>Setup incomplete</h2><p>Missing secrets: <code>${missing
+      ? `<div class="card" style="border-color:#f59e0b"><h2>Setup incomplete</h2><p>Missing (or placeholder) secrets: <code>${missing
           .map(escapeHtml)
           .join("</code>, <code>")}</code>.</p><p class="muted">Set them with <code>wrangler secret put NAME</code> (or in the Cloudflare dashboard under Settings → Variables and Secrets), then reload.</p></div>`
       : "";
@@ -74,7 +73,6 @@ export function statusPage(env: Env, data: StatusPageData): Response {
 <tr><th>Endpoint</th><td><code>${escapeHtml(data.origin)}/mcp</code></td></tr>
 <tr><th>Auth</th><td>OAuth (sign in with the admin password when the client asks)${env.MCP_STATIC_TOKEN ? ", or <code>Authorization: Bearer &lt;MCP_STATIC_TOKEN&gt;</code> (read-only unless <code>MCP_STATIC_TOKEN_SCOPES</code> adds more)" : ""}</td></tr>
 <tr><th>Tools</th><td>listDirectory, listNotes, listRecentNotes, readNote, readDailyNote, searchNotes, grepNotes, vaultStatus, appendToDailyNote, appendToNote, writeNote</td></tr>
-<tr><th>Time zone</th><td><code>${escapeHtml(policy.timeZone)}</code></td></tr>
 </table></div>
 <div class="card"><h2>Status</h2>${adminBlock}${indexHtml}</div>`,
   );
