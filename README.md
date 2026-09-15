@@ -37,7 +37,7 @@ Notes written through MCP are regular LiveSync revisions, so they show up in Obs
 4. Deploy. Durable Objects, KV, R2, Workers AI and Vectorize are created for you.
 5. Open your Worker's URL. The page shows the LiveSync URI, database name and MCP URL, and warns if a secret is still missing.
 
-Later pushes to your copy of the repository redeploy automatically.
+Later pushes to your copy of the repository redeploy automatically. Note that the copy is not a fork: it does not receive updates from this repository by itself. See [docs/upgrading.md](docs/upgrading.md) for pulling them in (it is a plain `git merge`; only `wrangler.jsonc` tends to conflict).
 
 ### Option B: wrangler
 
