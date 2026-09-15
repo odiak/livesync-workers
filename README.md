@@ -84,7 +84,7 @@ Point the client at `https://<your-worker>.workers.dev/mcp` (Streamable HTTP). I
 | `vault:append` | off | appendToDailyNote, appendToNote |
 | `vault:write` | off | writeNote |
 
-Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>` instead when that secret is set; it grants all scopes.
+Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>` instead when that secret is set. The token grants `vault:read` only; add `vault:append` and/or `vault:write` through the `MCP_STATIC_TOKEN_SCOPES` variable. Tools apply the same scope checks as for OAuth grants.
 
 ## Configuration
 
@@ -96,6 +96,7 @@ Variables (in `wrangler.jsonc` `vars`, editable in the dashboard):
 | `VAULT_TIMEZONE` | `UTC` | IANA time zone used to pick "today" for daily notes, e.g. `Asia/Tokyo` |
 | `VAULT_EXCLUDED_FOLDERS` | (empty) | Comma-separated folders left out of the search indexes (still readable) |
 | `APP_ORIGINS` | (empty) | Extra CORS origins besides the Obsidian defaults |
+| `MCP_STATIC_TOKEN_SCOPES` | (empty) | Extra scopes for the static token, e.g. `vault:append,vault:write` |
 
 Secrets: `LIVESYNC_USERNAME`, `LIVESYNC_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, optional `MCP_STATIC_TOKEN`.
 

@@ -10,4 +10,5 @@ ADMIN_PASSWORD=change-me-too
 SESSION_SECRET=change-me-to-a-random-string
 
 # Optional: a static bearer token for MCP clients that cannot do OAuth (leave empty to disable).
+# It grants vault:read only; widen it with the MCP_STATIC_TOKEN_SCOPES variable.
 MCP_STATIC_TOKEN=

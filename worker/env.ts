@@ -16,6 +16,7 @@ export interface Env {
   ADMIN_PASSWORD?: string;
   SESSION_SECRET?: string;
   MCP_STATIC_TOKEN?: string;
+  MCP_STATIC_TOKEN_SCOPES?: string;
 }
 
 export const TENANT_ID = "default";

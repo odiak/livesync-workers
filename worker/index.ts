@@ -12,6 +12,7 @@ import {
 import {
   checkAdminPassword,
   checkStaticToken,
+  staticTokenScopes,
   clearSessionCookie,
   createSessionCookie,
   isAdmin,
@@ -125,7 +126,11 @@ export default {
       const url = new URL(request.url);
       // Static bearer token bypasses OAuth for clients that cannot do it.
       if (url.pathname === "/mcp" && checkStaticToken(env, request)) {
-        const withProps = { ...ctx, props: { userId: "admin", label: "admin", scope: [...VAULT_SCOPES] } };
+        // Same principal shape as an OAuth grant, so tools apply the same scope checks.
+        const withProps = {
+          ...ctx,
+          props: { userId: "admin", label: "static-token", scope: staticTokenScopes(env) },
+        };
         return mcpHandler.fetch(request, env, withProps as unknown as ExecutionContext);
       }
       return await oauthProvider.fetch(

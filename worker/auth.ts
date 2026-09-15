@@ -50,6 +50,17 @@ export function checkAdminPassword(env: Env, password: string): boolean {
   return !!expected && constantTimeEquals(password, expected);
 }
 
+/** Scopes a static token grants: vault:read plus whatever MCP_STATIC_TOKEN_SCOPES allows. */
+export function staticTokenScopes(env: Env): string[] {
+  const allowed = new Set(["vault:read", "vault:append", "vault:write"]);
+  const scopes = new Set(["vault:read"]);
+  for (const raw of (env.MCP_STATIC_TOKEN_SCOPES ?? "").split(",")) {
+    const scope = raw.trim();
+    if (allowed.has(scope)) scopes.add(scope);
+  }
+  return [...scopes];
+}
+
 export function checkStaticToken(env: Env, request: Request): boolean {
   const token = env.MCP_STATIC_TOKEN;
   if (!token) return false;

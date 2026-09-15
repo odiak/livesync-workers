@@ -13,6 +13,8 @@
     "VAULT_EXCLUDED_FOLDERS": "",
     // Extra CORS origins (comma-separated) besides the Obsidian defaults.
     "APP_ORIGINS": "",
+    // Scopes granted to MCP_STATIC_TOKEN besides vault:read (comma-separated: vault:append,vault:write).
+    "MCP_STATIC_TOKEN_SCOPES": "",
   },
   "ai": { "binding": "AI" },
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
