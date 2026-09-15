@@ -15,8 +15,10 @@ function loadClient(): Api {
   return window.livesyncSetupUri;
 }
 
-// Reference decryption, transcribed from octagonal-wheels' encryption/hkdf.ts
-// (decryptWithEphemeralSalt), which is what the plugin uses to read a Setup URI.
+// Reference decryption, transcribed from decryptWithEphemeralSalt in
+// octagonal-wheels (src/encryption/hkdf.ts,
+// https://github.com/vrtmrz/octagonal-wheels), Copyright (c) 2024 vorotamoroz,
+// MIT License. It is what the plugin uses to read a Setup URI.
 async function referenceDecrypt(encrypted: string, passphrase: string): Promise<string> {
   if (!encrypted.startsWith("%$")) throw new Error("bad prefix");
   const bytes = Uint8Array.from(atob(encrypted.slice(2)), (c) => c.charCodeAt(0));

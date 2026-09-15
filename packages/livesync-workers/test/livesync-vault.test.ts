@@ -374,6 +374,29 @@ describe("LiveSync Vectorize indexing", () => {
     ).resolves.toMatchObject({ indexed: 1, pending: 0 });
   });
 
+
+  it("indexes a note whose chunk arrives after the periodic retries gave up", async () => {
+    const context = await created();
+    const { durableObject, upserted, storage } = context;
+    await replicate(durableObject, [noteDoc("late.md", "1-l", "late.md", ["h:late"])]);
+    for (let attempt = 0; attempt < 25; attempt += 1) await durableObject.alarm();
+    await expect(
+      json(await internalOp(durableObject, { op: "indexStatus" })),
+    ).resolves.toMatchObject({ indexed: 0, pending: 1 });
+    // Past the cap the alarm stops re-arming the periodic retry.
+    storage.setAlarm.mockClear();
+    await durableObject.alarm();
+    expect(storage.setAlarm).not.toHaveBeenCalled();
+
+    // Any chunk arrival re-checks pending notes regardless of the attempt count.
+    await replicate(durableObject, [leafDoc("h:late", "late content")]);
+    await durableObject.alarm();
+    expect(upserted.map((vector) => vector.metadata?.path)).toEqual(["late.md"]);
+    await expect(
+      json(await internalOp(durableObject, { op: "indexStatus" })),
+    ).resolves.toMatchObject({ indexed: 1, pending: 0 });
+  });
+
   it("re-scans everything on reindex and drops newly excluded folders", async () => {
     const context = await created();
     const { durableObject, deletedIds } = context;

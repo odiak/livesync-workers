@@ -90,7 +90,7 @@ Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>`
 
 ## Configuration
 
-Variables (in `wrangler.jsonc` `vars`, editable in the dashboard):
+Variables (in `wrangler.jsonc` `vars`, editable in the dashboard; `keep_vars` is on, so variables added in the dashboard survive deploys):
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -126,7 +126,8 @@ The `livesync-workers` npm package (in [`packages/livesync-workers`](packages/li
 ## Development
 
 ```sh
-npm install
+npm install       # also builds the library into packages/livesync-workers/dist (prepare)
+npm run build     # rebuild the library after editing packages/livesync-workers/src
 npm test          # library unit tests
 npm run typecheck
 npm run dev       # wrangler dev (needs a Cloudflare login for AI/Vectorize)

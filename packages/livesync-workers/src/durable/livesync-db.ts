@@ -286,15 +286,24 @@ function allDocsKey(value: unknown): string | null {
   }
 }
 
-function parentFromRevisions(doc: DocBody): string | null {
+/**
+ * Ancestors of a replicated revision, nearest first, from its `_revisions`
+ * path (`ids[0]` is the revision itself). Replicators send only leaves, so
+ * the generations in between must be recorded from this list or the
+ * previously stored ancestor stays a leaf and surfaces as a conflict.
+ */
+function ancestorsFromRevisions(doc: DocBody): string[] {
   const rev = typeof doc._rev === "string" ? parseRev(doc._rev) : null;
   const revisions = doc._revisions as
     | { start?: unknown; ids?: unknown }
     | undefined;
-  if (!rev || !revisions || !Array.isArray(revisions.ids)) return null;
+  if (!rev || !revisions || !Array.isArray(revisions.ids)) return [];
   const ids = revisions.ids.filter((id): id is string => typeof id === "string");
-  if (ids.length < 2) return null;
-  return `${rev.gen - 1}-${ids[1]}`;
+  const ancestors: string[] = [];
+  for (let index = 1; index < ids.length && rev.gen - index >= 1; index += 1) {
+    ancestors.push(`${rev.gen - index}-${ids[index]}`);
+  }
+  return ancestors;
 }
 
 function revisionHistory(doc: DocBody, rev: string, parentHistory?: string | null): string {
@@ -545,6 +554,47 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         );
         sql.exec(`INSERT INTO _sql_schema_migrations (id) VALUES (2)`);
       });
+    }
+    if (schemaVersion < 3) {
+      // Replicated revisions whose skipped ancestors were never recorded left
+      // the stored ancestor as a leaf (a phantom conflict that resurrected
+      // deleted notes). Reconnect the trees and recompute winners, and make
+      // docs.updated_seq the document's latest change.
+      const touched = new Set<string>();
+      this.ctx.storage.transactionSync(() => {
+        const orphans = sql
+          .exec<{ id: string; rev: string; seq: number; rev_history: string | null }>(
+            `SELECT r.id, r.rev, r.seq, r.rev_history FROM revs r
+             WHERE r.parent_rev IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM revs p WHERE p.id = r.id AND p.rev = r.parent_rev)`,
+          )
+          .toArray();
+        for (const orphan of orphans) {
+          let revisions: unknown = null;
+          try {
+            revisions = orphan.rev_history ? JSON.parse(orphan.rev_history) : null;
+          } catch {
+            // Unreadable history: leave this branch as it is.
+          }
+          if (!revisions) continue;
+          const ancestors = ancestorsFromRevisions({ _rev: orphan.rev, _revisions: revisions });
+          this.insertAncestorStubs(orphan.id, ancestors, orphan.seq);
+          touched.add(orphan.id);
+        }
+        for (const id of touched) this.recalculateWinner(id);
+        sql.exec(
+          `UPDATE docs SET updated_seq =
+             (SELECT COALESCE(MAX(seq), 0) FROM changes WHERE changes.id = docs.id)`,
+        );
+        sql.exec(`INSERT INTO _sql_schema_migrations (id) VALUES (3)`);
+      });
+      if (touched.size > 0) {
+        // Winners changed without a new change row; re-scan the search indexes
+        // (unchanged notes are skipped by hash, so nothing is re-embedded).
+        this.setMeta(INDEXED_SEQ_META_KEY, "0");
+        this.armFtsRebuild(0);
+        void this.scheduleIndexing(0);
+      }
     }
     sql.exec(`
       CREATE TABLE IF NOT EXISTS index_state (
@@ -1049,13 +1099,11 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       INDEX_BATCH_SIZE,
     );
     const ids = new Set(changes.map((change) => change.id));
-    const pendingRows = this.rows<IndexStateRow>(
-      `SELECT * FROM index_state WHERE pending = 1 AND attempts < ?`,
-      INDEX_MAX_ATTEMPTS,
-    );
+    const pendingRows = this.rows<IndexStateRow>(`SELECT * FROM index_state WHERE pending = 1`);
 
     // Paths whose winning doc changed in this batch.
     const touchedPaths = new Map<string, RevRow | null>();
+    let chunkArrived = false;
     for (const id of ids) {
       const row = this.rawWinningRow(id);
       if (!row) continue;
@@ -1065,6 +1113,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         touchedPaths.set(doc.path, row.deleted || docIsDeleted(doc) ? null : hydrated);
         continue;
       }
+      if (!row.deleted && !docIsDeleted(doc)) chunkArrived = true;
       // Tombstones carry no path; recover it from the index state or an earlier revision.
       const previousPath =
         this.first<{ path: string }>(`SELECT path FROM index_state WHERE doc_id = ?`, id)?.path ??
@@ -1076,12 +1125,15 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         touchedPaths.set(previousPath, this.findNoteRow(previousPath));
       }
     }
+    // Chunk arrivals do not carry a path: re-check every pending note when a
+    // chunk arrived, however often it was tried before. Without one, only
+    // notes still under the periodic retry cap are re-checked.
     for (const pending of pendingRows) {
-      if (!touchedPaths.has(pending.path)) {
+      if (touchedPaths.has(pending.path)) continue;
+      if (chunkArrived || pending.attempts < INDEX_MAX_ATTEMPTS) {
         touchedPaths.set(pending.path, this.findNoteRow(pending.path));
       }
     }
-    // Chunk arrivals do not carry a path; re-check pending notes on any change.
     let retry = false;
     for (const [path, row] of touchedPaths) {
       const state = this.first<IndexStateRow>(`SELECT * FROM index_state WHERE path = ?`, path);
@@ -1095,16 +1147,20 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       }
       const content = this.fileContentForRow(row);
       if (content == null) {
-        // Chunks not replicated yet; mark pending and retry later.
-        this.ctx.storage.sql.exec(
-          `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts)
-           VALUES (?, ?, NULL, 0, 1, 1)
-           ON CONFLICT(path) DO UPDATE SET
-             doc_id = excluded.doc_id, pending = 1, attempts = index_state.attempts + 1`,
-          path,
-          row.id,
-        );
-        retry = true;
+        // Chunks not replicated yet; mark pending. Periodic retries stop at
+        // INDEX_MAX_ATTEMPTS, but the note stays pending and is re-checked
+        // whenever a chunk arrives.
+        const attempts =
+          this.first<{ attempts: number }>(
+            `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts)
+             VALUES (?, ?, NULL, 0, 1, 1)
+             ON CONFLICT(path) DO UPDATE SET
+               doc_id = excluded.doc_id, pending = 1, attempts = index_state.attempts + 1
+             RETURNING attempts`,
+            path,
+            row.id,
+          )?.attempts ?? INDEX_MAX_ATTEMPTS;
+        if (attempts < INDEX_MAX_ATTEMPTS) retry = true;
         continue;
       }
       const hash = await hashText(content);
@@ -1421,9 +1477,12 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       return;
     }
     const winner = leaves.sort(compareWinning).at(-1)!;
+    // updated_seq is the document's latest change, not the winner's own seq:
+    // a _changes reader must learn that the winner changed (e.g. the old
+    // winner was deleted) even when the new winner's revision is old.
     this.ctx.storage.sql.exec(
       `INSERT INTO docs (id, winning_rev, deleted, updated_seq)
-       VALUES (?, ?, ?, ?)
+       VALUES (?, ?, ?, (SELECT COALESCE(MAX(seq), 0) FROM changes WHERE id = ?))
        ON CONFLICT(id) DO UPDATE SET
          winning_rev = excluded.winning_rev,
          deleted = excluded.deleted,
@@ -1431,7 +1490,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       id,
       winner.rev,
       winner.deleted,
-      winner.seq,
+      id,
     );
   }
 
@@ -1461,11 +1520,35 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       .map((row) => row.rev);
   }
 
+  /**
+   * Records ancestors the replicator skipped (nearest first) as body-less
+   * stub revisions so the tree stays connected. Stops at the first ancestor
+   * already stored, whose own chain is then already in place.
+   */
+  private insertAncestorStubs(id: string, ancestors: string[], seq: number): void {
+    for (const [index, rev] of ancestors.entries()) {
+      if (this.rawRevRow(id, rev)) break;
+      const parsed = parseRev(rev);
+      if (!parsed) break;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO revs
+           (id, rev, gen, parent_rev, body, body_chunked, body_available, deleted, seq, rev_history)
+         VALUES (?, ?, ?, ?, '{}', 0, 0, 0, ?, NULL)`,
+        id,
+        rev,
+        parsed.gen,
+        ancestors[index + 1] ?? null,
+        seq,
+      );
+    }
+  }
+
   private writeRevision(row: {
     id: string;
     rev: string;
     gen: number;
     parentRev: string | null;
+    ancestors?: string[];
     body: string;
     metadata: RevisionMetadata;
     deleted: number;
@@ -1474,6 +1557,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }): void {
     const chunks = splitRevisionBody(row.body);
     this.ctx.storage.transactionSync(() => {
+      if (row.ancestors) this.insertAncestorStubs(row.id, row.ancestors, row.seq);
       this.ctx.storage.sql.exec(
         `INSERT INTO revs
            (id, rev, gen, parent_rev, body, body_chunked, body_available, deleted, seq, rev_history)
@@ -1546,22 +1630,21 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     if (!id) return { ok: false, id: "", error: "bad_request", reason: "Document id is required." };
 
     if (options.newEdits) {
-      const current = this.rawWinningRow(id);
       let parentRev = typeof doc._rev === "string" ? doc._rev : null;
-      if (current && current.deleted && !parentRev) parentRev = current.rev;
-      if (current && parentRev !== current.rev) {
-        return { ok: false, id, error: "conflict", reason: "Document update conflict." };
-      }
-      if (!current && parentRev) {
-        return { ok: false, id, error: "conflict", reason: "Document update conflict." };
-      }
-      const parent = parentRev ? this.rawRevRow(id, parentRev) : null;
-      if (parentRev && !parent) {
-        return { ok: false, id, error: "conflict", reason: "Document update conflict." };
-      }
+      const deletedWinner = this.rawWinningRow(id);
+      if (deletedWinner && deletedWinner.deleted && !parentRev) parentRev = deletedWinner.rev;
       const rev = await newRevision(doc, parentRev);
-      const latest = this.rawWinningRow(id);
-      if ((latest?.rev ?? null) !== (current?.rev ?? null)) {
+      // Check the tree after the only await, so nothing changed in between.
+      const current = this.rawWinningRow(id);
+      if (!parentRev && current) {
+        return { ok: false, id, error: "conflict", reason: "Document update conflict." };
+      }
+      // Any current leaf may be extended, not only the winner: deleting a
+      // losing revision is how CouchDB conflicts are resolved.
+      const parent = parentRev
+        ? this.rawLeafRevs(id).find((leaf) => leaf.rev === parentRev) ?? null
+        : null;
+      if (parentRev && !parent) {
         return { ok: false, id, error: "conflict", reason: "Document update conflict." };
       }
       const seq = this.nextSeq();
@@ -1592,13 +1675,14 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     const parsed = parseRev(doc._rev)!;
     const seq = this.nextSeq();
     const deleted = doc._deleted === true ? 1 : 0;
-    const parentRev = parentFromRevisions(doc);
+    const ancestors = ancestorsFromRevisions(doc);
     const stored: DocBody = { ...withoutMeta(doc), _id: id, _rev: doc._rev };
     this.writeRevision({
       id,
       rev: doc._rev,
       gen: parsed.gen,
-      parentRev,
+      parentRev: ancestors[0] ?? null,
+      ancestors,
       body: JSON.stringify(stored),
       metadata: revisionMetadata(stored),
       deleted,
@@ -1953,23 +2037,19 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     const selector = (options.selector ?? null) as Selector | null;
     const style = String(options.style ?? "main_only");
     const scanLimit = selector ? Math.min(limit * 10, 5000) : limit;
+    // Each document appears once, at its latest change (docs.updated_seq),
+    // with the winner as of now; that is also how the winner switching to an
+    // older revision (after the previous winner was deleted) gets reported.
+    const candidates = this.rows<ChangeRow>(
+      `SELECT updated_seq AS seq, id, winning_rev AS rev, deleted
+       FROM docs
+       WHERE updated_seq > ?
+       ORDER BY updated_seq
+       LIMIT ?`,
+      since,
+      scanLimit,
+    );
     if (style === "all_docs") {
-      const candidates = this.rows<ChangeRow>(
-        `WITH latest AS (
-           SELECT id, MAX(seq) AS seq
-           FROM changes
-           WHERE seq > ?
-           GROUP BY id
-           ORDER BY seq
-           LIMIT ?
-         )
-         SELECT latest.seq, d.id, d.winning_rev AS rev, d.deleted
-         FROM latest
-         JOIN docs d ON d.id = latest.id
-         ORDER BY latest.seq`,
-        since,
-        scanLimit,
-      );
       const rows = candidates
         .map<ChangeRow | null>((row) => {
           const leaves = this.rawLeafRevs(row.id);
@@ -2000,21 +2080,11 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       };
     }
 
-    const candidates = this.rows<ChangeRow>(
-      `SELECT c.*
-       FROM changes c
-       JOIN docs d ON d.id = c.id AND d.winning_rev = c.rev
-       WHERE c.seq > ?
-       ORDER BY c.seq
-       LIMIT ?`,
-      since,
-      scanLimit,
-    );
     const rows = candidates
       .filter((row) => {
-        const winning = this.rawWinningRow(row.id);
-        if (!winning || winning.rev !== row.rev) return false;
         if (!selector) return true;
+        const winning = this.rawWinningRow(row.id);
+        if (!winning) return false;
         return matchesSelector(this.publicDoc(this.hydrateRevision(winning)), selector);
       });
     const limited = rows.slice(0, limit);

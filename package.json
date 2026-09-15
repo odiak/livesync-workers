@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "build": "npm run build -w livesync-workers",
+    "prepare": "npm run build -w livesync-workers",
     "deploy": "wrangler deploy",
     "dev": "npm run build && wrangler dev",
     "setup": "node scripts/setup.mjs",

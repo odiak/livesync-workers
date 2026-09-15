@@ -45,7 +45,13 @@ export type VaultOAuthOptions<Env> = {
   refreshTokenTTL?: number;
 };
 
-type ParsedAuthRequest = { clientId: string; scope: string[]; redirectUri: string };
+type ParsedAuthRequest = {
+  clientId: string;
+  scope: string[];
+  redirectUri: string;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+};
 
 type ProviderEnv = {
   OAUTH_PROVIDER?: {
@@ -131,6 +137,18 @@ function consentHandler<Env>(options: VaultOAuthOptions<Env>): ExportedHandler<E
         return htmlPage(
           title,
           `<div class="card"><h1>OAuth request error</h1><p>${escapeHtml(message)}</p></div>`,
+          400,
+          lang,
+        );
+      }
+
+      // The provider leaves PKCE optional: a request carrying only
+      // code_challenge_method=S256 and no challenge would still get a code
+      // that anyone intercepting it could redeem. OAuth 2.1 and MCP require S256.
+      if (!authRequest.codeChallenge || authRequest.codeChallengeMethod !== "S256") {
+        return htmlPage(
+          title,
+          '<div class="card"><h1>OAuth request error</h1><p>PKCE is required: send <code>code_challenge</code> with <code>code_challenge_method=S256</code>.</p></div>',
           400,
           lang,
         );

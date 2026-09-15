@@ -20,6 +20,7 @@ import {
   clearSessionCookie,
   createSessionCookie,
   isAdmin,
+  safeRedirectTarget,
 } from "./auth.js";
 import { loginPage, statusPage } from "./pages.js";
 import { VaultMCP } from "./mcp.js";
@@ -37,10 +38,6 @@ export class VaultDO extends LiveSyncVaultDO<Env> {
 
 const mcpHandler = VaultMCP.serve("/mcp", { binding: "MCP_OBJECT" });
 
-function safeNext(raw: string | null): string {
-  return raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : "/";
-}
-
 const appHandler: ExportedHandler<Env> = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -50,12 +47,12 @@ const appHandler: ExportedHandler<Env> = {
     }
 
     if (url.pathname === "/login") {
-      const next = safeNext(url.searchParams.get("next"));
+      const next = safeRedirectTarget(url.searchParams.get("next"), url.origin);
       if (request.method === "GET") return loginPage(next);
       if (request.method === "POST") {
         const form = await request.formData().catch(() => null);
         const password = String(form?.get("password") ?? "");
-        const target = safeNext(String(form?.get("next") ?? next));
+        const target = safeRedirectTarget(String(form?.get("next") ?? next), url.origin);
         if (!checkAdminPassword(env, password)) {
           return loginPage(target, "Wrong password.");
         }

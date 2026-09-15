@@ -1,6 +1,10 @@
 /**
  * Browser-side generator for a Self-hosted LiveSync "Setup URI".
  *
+ * The encryption below follows encryptWithEphemeralSalt in octagonal-wheels
+ * (src/encryption/hkdf.ts, https://github.com/vrtmrz/octagonal-wheels),
+ * Copyright (c) 2024 vorotamoroz, MIT License.
+ *
  * The plugin's "Use Setup URI" option accepts
  *   obsidian://setuplivesync?settings=<encodeURIComponent(encrypted JSON)>
  * where the JSON is the plugin's settings object and the encryption is

@@ -382,7 +382,7 @@ describe("LiveSync revision body chunking", () => {
 
     expect(columns.some((column) => column.name === "body_chunked")).toBe(true);
     expect(columns.some((column) => column.name === "body_available")).toBe(true);
-    expect(migrations).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(migrations).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
   });
 
   it("resumes a migration when the column exists before its migration record", () => {
@@ -396,7 +396,39 @@ describe("LiveSync revision body chunking", () => {
     ).all();
 
     expect(columns.filter((column) => column.name === "body_available")).toHaveLength(1);
-    expect(migrations).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(migrations).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+  });
+
+  it("reconnects revision trees and recomputes winners when migrating to schema 3", async () => {
+    const { durableObject, database, storage } = await liveSyncDbCreated();
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "1-a", _revisions: { start: 1, ids: ["a"] }, v: 1 },
+      { _id: "n", _rev: "3-c", _revisions: { start: 3, ids: ["c", "b", "a"] }, v: 3 },
+      { _id: "n", _rev: "4-d", _revisions: { start: 4, ids: ["d", "c", "b", "a"] }, _deleted: true },
+      { _id: "other", _rev: "1-o", _revisions: { start: 1, ids: ["o"] } },
+    ]);
+    // Rewind to what schema 2 stored: no stub for 2-b, so 1-a was a leaf and
+    // won over the tombstone; updated_seq was the winner's own seq.
+    database.exec(`DELETE FROM revs WHERE id = 'n' AND rev = '2-b'`);
+    database.exec(`UPDATE docs SET winning_rev = '1-a', deleted = 0, updated_seq = 1 WHERE id = 'n'`);
+    database.exec(`DELETE FROM _sql_schema_migrations WHERE id = 3`);
+
+    const reopened = new TestVaultDO({ storage } as unknown as DurableObjectState, testEnv());
+    expect(database.prepare(`SELECT id FROM _sql_schema_migrations ORDER BY id`).all())
+      .toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(database.prepare(`SELECT rev, parent_rev, body_available FROM revs WHERE id = 'n' ORDER BY gen`).all())
+      .toEqual([
+        { rev: "1-a", parent_rev: null, body_available: 1 },
+        { rev: "2-b", parent_rev: "1-a", body_available: 0 },
+        { rev: "3-c", parent_rev: "2-b", body_available: 1 },
+        { rev: "4-d", parent_rev: "3-c", body_available: 1 },
+      ]);
+    expect(database.prepare(`SELECT id, winning_rev, deleted, updated_seq FROM docs ORDER BY id`).all())
+      .toEqual([
+        { id: "n", winning_rev: "4-d", deleted: 1, updated_seq: 3 },
+        { id: "other", winning_rev: "1-o", deleted: 0, updated_seq: 4 },
+      ]);
+    expect((await reopened.fetch(new Request("https://db/n"))).status).toBe(404);
   });
 });
 
@@ -734,6 +766,98 @@ describe("LiveSync CouchDB compatibility", () => {
       changes: [{ rev: "2-z-winner" }],
       doc: { value: "winner" },
     });
+  });
+
+  it("records skipped generations so an old ancestor is not a leaf", async () => {
+    const { durableObject, database } = await liveSyncDbCreated();
+    // The client edited twice between syncs: the server has 1-a, receives 3-c.
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "1-a", _revisions: { start: 1, ids: ["a"] }, v: 1 },
+    ]);
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "3-c", _revisions: { start: 3, ids: ["c", "b", "a"] }, v: 3 },
+    ]);
+    const doc = await (await durableObject.fetch(
+      new Request("https://db/n?conflicts=true"),
+    )).json() as Record<string, unknown>;
+    expect(doc).toEqual({ _id: "n", _rev: "3-c", v: 3 });
+    expect(database.prepare(`SELECT rev, parent_rev, body_available FROM revs WHERE id = 'n' ORDER BY gen`).all())
+      .toEqual([
+        { rev: "1-a", parent_rev: null, body_available: 1 },
+        { rev: "2-b", parent_rev: "1-a", body_available: 0 },
+        { rev: "3-c", parent_rev: "2-b", body_available: 1 },
+      ]);
+    // The stub is known to _revs_diff but has no body to serve.
+    await expect((await durableObject.fetch(
+      postRequest("https://db/_revs_diff", { n: ["2-b", "9-x"] }),
+    )).json()).resolves.toEqual({ n: { missing: ["9-x"] } });
+    await expect((await durableObject.fetch(
+      new Request('https://db/n?open_revs=["2-b"]'),
+    )).json()).resolves.toEqual([{ missing: "2-b" }]);
+
+    // Deleting the note must not resurrect 1-a.
+    await replicatedDocs(durableObject, [
+      { _id: "n", _rev: "4-d", _revisions: { start: 4, ids: ["d", "c", "b", "a"] }, _deleted: true },
+    ]);
+    expect((await durableObject.fetch(new Request("https://db/n"))).status).toBe(404);
+    const all = await (await durableObject.fetch(new Request("https://db/_all_docs"))).json() as { rows: unknown[] };
+    expect(all.rows).toEqual([]);
+  });
+
+  it("lets a losing leaf be deleted to resolve a conflict", async () => {
+    const { durableObject } = await liveSyncDbCreated();
+    await replicatedDocs(durableObject, [
+      { _id: "c", _rev: "1-root", _revisions: { start: 1, ids: ["root"] } },
+      { _id: "c", _rev: "2-z-winner", _revisions: { start: 2, ids: ["z-winner", "root"] }, value: "winner" },
+      { _id: "c", _rev: "2-a-loser", _revisions: { start: 2, ids: ["a-loser", "root"] }, value: "loser" },
+    ]);
+    const removed = await durableObject.fetch(
+      new Request("https://db/c?rev=2-a-loser", { method: "DELETE" }),
+    );
+    expect(removed.status).toBe(200);
+    await expect((await durableObject.fetch(
+      new Request("https://db/c?conflicts=true"),
+    )).json()).resolves.toEqual({ _id: "c", _rev: "2-z-winner", value: "winner" });
+
+    // A revision that is not a leaf still conflicts.
+    const stale = await durableObject.fetch(
+      new Request("https://db/c?rev=1-root", { method: "DELETE" }),
+    );
+    expect(stale.status).toBe(409);
+  });
+
+  it("reports the winner switching to an older revision in main_only changes", async () => {
+    const { durableObject } = await liveSyncDbCreated();
+    await replicatedDocs(durableObject, [
+      { _id: "c", _rev: "1-root", _revisions: { start: 1, ids: ["root"] } },
+      { _id: "c", _rev: "2-z-winner", _revisions: { start: 2, ids: ["z-winner", "root"] }, value: "winner" },
+      { _id: "c", _rev: "2-a-loser", _revisions: { start: 2, ids: ["a-loser", "root"] }, value: "loser" },
+    ]);
+    const first = await (await durableObject.fetch(
+      new Request("https://db/_changes?since=0"),
+    )).json() as { results: Array<{ seq: number; changes: Array<{ rev: string }> }>; last_seq: number };
+    expect(first.results).toEqual([{ seq: 3, id: "c", changes: [{ rev: "2-z-winner" }] }]);
+    expect(first.last_seq).toBe(3);
+
+    await replicatedDocs(durableObject, [
+      { _id: "c", _rev: "3-del", _revisions: { start: 3, ids: ["del", "z-winner", "root"] }, _deleted: true },
+    ]);
+    for (const style of ["main_only", "all_docs"]) {
+      const next = await (await durableObject.fetch(
+        new Request(`https://db/_changes?since=${first.last_seq}&style=${style}&include_docs=true`),
+      )).json() as { results: Array<Record<string, unknown>>; last_seq: number };
+      expect(next.last_seq).toBe(4);
+      expect(next.results).toHaveLength(1);
+      expect(next.results[0]).toMatchObject({
+        seq: 4,
+        id: "c",
+        changes: style === "main_only"
+          ? [{ rev: "2-a-loser" }]
+          : [{ rev: "2-a-loser" }, { rev: "3-del" }],
+        doc: { _rev: "2-a-loser", value: "loser" },
+      });
+      expect(next.results[0]!.deleted).toBeUndefined();
+    }
   });
 });
 

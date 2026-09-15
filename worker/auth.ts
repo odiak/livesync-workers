@@ -6,6 +6,23 @@ export const SESSION_COOKIE = "ls_admin";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const enc = new TextEncoder();
 
+/**
+ * Same-origin path for the post-login redirect, or "/" for anything else.
+ * A prefix check is not enough: browsers read `/\evil.example` as
+ * `//evil.example`, so the value is parsed against the request origin.
+ */
+export function safeRedirectTarget(raw: string | null, origin: string): string {
+  if (!raw || !raw.startsWith("/")) return "/";
+  let target: URL;
+  try {
+    target = new URL(raw, origin);
+  } catch {
+    return "/";
+  }
+  if (target.origin !== origin) return "/";
+  return `${target.pathname}${target.search}`;
+}
+
 async function hmacHex(secret: string, message: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
