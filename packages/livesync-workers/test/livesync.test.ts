@@ -429,10 +429,19 @@ describe("LiveSync revision body chunking", () => {
       ]);
     expect(database.prepare(`SELECT id, winning_rev, deleted, updated_seq FROM docs ORDER BY id`).all())
       .toEqual([
-        { id: "n", winning_rev: "4-d", deleted: 1, updated_seq: 3 },
+        // "n" gets a fresh change row so replicas that saw 1-a win re-fetch it.
+        { id: "n", winning_rev: "4-d", deleted: 1, updated_seq: 7 },
         { id: "other", winning_rev: "1-o", deleted: 0, updated_seq: 4 },
         { id: "short", winning_rev: "2-t", deleted: 0, updated_seq: 6 },
       ]);
+    expect(database.prepare(`SELECT seq, id, rev, deleted FROM changes WHERE seq > 6`).all())
+      .toEqual([{ seq: 7, id: "n", rev: "4-d", deleted: 1 }]);
+    await expect((await reopened.fetch(
+      new Request("https://db/_changes?since=6"),
+    )).json()).resolves.toMatchObject({
+      results: [{ id: "n", seq: 7, deleted: true, changes: [{ rev: "4-d" }] }],
+      last_seq: 7,
+    });
     expect(database.prepare(`SELECT parent_rev FROM revs WHERE id = 'short' AND rev = '2-t'`).get())
       .toEqual({ parent_rev: "1-s" });
     await expect((await reopened.fetch(

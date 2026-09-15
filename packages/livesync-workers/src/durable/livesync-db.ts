@@ -12,7 +12,6 @@ import {
   secretEquals,
 } from "../livesync/http.js";
 import {
-  DEFAULT_VAULT_POLICY,
   isReservedPath,
   parseVaultObjectName,
   type VaultBindings,
@@ -591,7 +590,22 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
           this.linkAncestors(orphan.id, ancestors, orphan.seq);
           touched.add(orphan.id);
         }
-        for (const id of touched) this.recalculateWinner(id);
+        for (const id of touched) {
+          const before = this.first<DocRow>(`SELECT * FROM docs WHERE id = ?`, id);
+          this.recalculateWinner(id);
+          const after = this.first<DocRow>(`SELECT * FROM docs WHERE id = ?`, id);
+          if (!after?.winning_rev || after.winning_rev === before?.winning_rev) continue;
+          // Clients that replicated the phantom winner have checkpoints past
+          // this document; a new change row is the only way they learn of
+          // the corrected winner.
+          sql.exec(
+            `INSERT INTO changes (seq, id, rev, deleted) VALUES (?, ?, ?, ?)`,
+            this.nextSeq(),
+            id,
+            after.winning_rev,
+            after.deleted,
+          );
+        }
         sql.exec(
           `UPDATE docs SET updated_seq =
              (SELECT COALESCE(MAX(seq), 0) FROM changes WHERE changes.id = docs.id)`,
@@ -1032,13 +1046,12 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     return name ? parseVaultObjectName(name) : null;
   }
 
-  private async loadPolicy(ref: VaultRef): Promise<VaultPolicy> {
-    try {
-      return await this.host().loadVaultPolicy(ref);
-    } catch (error) {
-      console.warn("loadVaultPolicy failed; using defaults", error);
-      return DEFAULT_VAULT_POLICY;
-    }
+  /**
+   * Errors propagate: indexing with a default policy would expose reserved
+   * paths and excluded folders, so the alarm retries instead.
+   */
+  private loadPolicy(ref: VaultRef): Promise<VaultPolicy> {
+    return this.host().loadVaultPolicy(ref);
   }
 
   private indexedSeq(): number {
