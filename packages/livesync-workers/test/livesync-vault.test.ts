@@ -457,6 +457,29 @@ describe("LiveSync Vectorize indexing", () => {
     );
     expect(deletedIds).toHaveLength(1);
   });
+
+  it("purge fails and keeps the data when the FTS index cannot be deleted", async () => {
+    const context = await created();
+    const { durableObject, env } = context;
+    await replicate(durableObject, [
+      leafDoc("h:a", "content"),
+      noteDoc("a.md", "1-a", "a.md", ["h:a"]),
+    ]);
+    const list = vi.mocked(env.FTS_BUCKET.list);
+    list.mockRejectedValue(new Error("R2 unavailable"));
+    const res = await durableObject.fetch(
+      new Request("https://db/internal/purge", {
+        method: "POST",
+        headers: { "X-LiveSync-Internal": "test-secret" },
+      }),
+    );
+    list.mockReset();
+    expect(res.status).toBe(500);
+    // Nothing was deleted, so a retry can still reach the index and the notes.
+    await expect(json(await internalOp(durableObject, { op: "listMarkdownPaths" }))).resolves.toEqual({
+      paths: ["a.md"],
+    });
+  });
 });
 
 describe("LiveSync indexing catch-up", () => {

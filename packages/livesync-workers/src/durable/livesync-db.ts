@@ -638,77 +638,83 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   async fetch(request: Request): Promise<Response> {
+    // `return await`: a handler's rejected promise must reach this catch,
+    // which a bare `return handler()` inside try would skip.
     try {
-      const url = new URL(request.url);
-      const parts = url.pathname.split("/").filter(Boolean);
-      if (request.method === "OPTIONS") return new Response(null, { status: 204 });
-      // Existing databases (created before indexing existed, or indexed under an
-      // older index version) catch up on first access.
-      if (
-        Date.now() - this.lastIndexScheduleAt > 5_000 &&
-        this.dbExists() &&
-        (this.indexNeedsVersionUpgrade() || this.indexedSeq() < this.currentSeq())
-      ) {
-        void this.scheduleIndexing();
-      }
-      if (url.pathname.startsWith("/internal/")) {
-        if (!secretEquals(request.headers.get(INTERNAL_SECRET_HEADER), this.host().internalSecret)) {
-          return couchError(403, "forbidden", "Forbidden");
-        }
-        if (url.pathname === "/internal/watch" && request.method === "GET") {
-          if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-            return couchError(426, "upgrade_required", "Expected WebSocket");
-          }
-          return this.acceptWatcher();
-        }
-        if (url.pathname === "/internal/purge" && request.method === "POST") {
-          return this.deleteDb();
-        }
-        if (url.pathname === "/internal/files" && request.method === "GET") {
-          return this.listFiles();
-        }
-        if (url.pathname === "/internal/file" && request.method === "GET") {
-          return this.readFile(url.searchParams.get("path") ?? "");
-        }
-        if (url.pathname === "/internal/op" && request.method === "POST") {
-          return this.handleInternalOp((await readJsonBody(request)) as InternalOp);
-        }
-        return couchError(404, "not_found", "missing");
-      }
-
-      const dbName = request.headers.get(DB_NAME_HEADER) ?? "livesync";
-
-      if (parts.length === 0) {
-        if (request.method === "HEAD") return this.hasDbHead();
-        if (request.method === "GET") return this.dbInfo(dbName);
-        if (request.method === "PUT") return this.putDb(dbName);
-        if (request.method === "DELETE") return this.deleteDb();
-      }
-
-      const first = parts[0]!;
-      if (first === "_changes" && (request.method === "GET" || request.method === "POST")) {
-        return this.handleChanges(request);
-      }
-      if (first === "_revs_diff" && request.method === "POST") return this.handleRevsDiff(request);
-      if (first === "_bulk_docs" && request.method === "POST") return this.handleBulkDocs(request);
-      if (first === "_bulk_get" && request.method === "POST") return this.handleBulkGet(request);
-      if (first === "_all_docs" && (request.method === "GET" || request.method === "POST")) {
-        return this.handleAllDocs(request);
-      }
-      if (first === "_find" && request.method === "POST") return this.handleFind(request);
-      if (first === "_compact" && request.method === "POST") return this.handleCompact();
-
-      if (first === "_local") {
-        const id = decodeURIComponent(parts.slice(1).join("/"));
-        return this.handleLocalDoc(request, id);
-      }
-
-      const id = decodeURIComponent(parts.join("/"));
-      return this.handleDoc(request, id);
+      return await this.route(request);
     } catch (error) {
       console.warn("LiveSync DB request failed", error);
       return couchError(500, "internal_server_error", "Internal server error");
     }
+  }
+
+  private async route(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204 });
+    // Existing databases (created before indexing existed, or indexed under an
+    // older index version) catch up on first access.
+    if (
+      Date.now() - this.lastIndexScheduleAt > 5_000 &&
+      this.dbExists() &&
+      (this.indexNeedsVersionUpgrade() || this.indexedSeq() < this.currentSeq())
+    ) {
+      void this.scheduleIndexing();
+    }
+    if (url.pathname.startsWith("/internal/")) {
+      if (!secretEquals(request.headers.get(INTERNAL_SECRET_HEADER), this.host().internalSecret)) {
+        return couchError(403, "forbidden", "Forbidden");
+      }
+      if (url.pathname === "/internal/watch" && request.method === "GET") {
+        if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+          return couchError(426, "upgrade_required", "Expected WebSocket");
+        }
+        return this.acceptWatcher();
+      }
+      if (url.pathname === "/internal/purge" && request.method === "POST") {
+        return this.deleteDb();
+      }
+      if (url.pathname === "/internal/files" && request.method === "GET") {
+        return this.listFiles();
+      }
+      if (url.pathname === "/internal/file" && request.method === "GET") {
+        return this.readFile(url.searchParams.get("path") ?? "");
+      }
+      if (url.pathname === "/internal/op" && request.method === "POST") {
+        return this.handleInternalOp((await readJsonBody(request)) as InternalOp);
+      }
+      return couchError(404, "not_found", "missing");
+    }
+
+    const dbName = request.headers.get(DB_NAME_HEADER) ?? "livesync";
+
+    if (parts.length === 0) {
+      if (request.method === "HEAD") return this.hasDbHead();
+      if (request.method === "GET") return this.dbInfo(dbName);
+      if (request.method === "PUT") return this.putDb(dbName);
+      if (request.method === "DELETE") return this.deleteDb();
+    }
+
+    const first = parts[0]!;
+    if (first === "_changes" && (request.method === "GET" || request.method === "POST")) {
+      return this.handleChanges(request);
+    }
+    if (first === "_revs_diff" && request.method === "POST") return this.handleRevsDiff(request);
+    if (first === "_bulk_docs" && request.method === "POST") return this.handleBulkDocs(request);
+    if (first === "_bulk_get" && request.method === "POST") return this.handleBulkGet(request);
+    if (first === "_all_docs" && (request.method === "GET" || request.method === "POST")) {
+      return this.handleAllDocs(request);
+    }
+    if (first === "_find" && request.method === "POST") return this.handleFind(request);
+    if (first === "_compact" && request.method === "POST") return this.handleCompact();
+
+    if (first === "_local") {
+      const id = decodeURIComponent(parts.slice(1).join("/"));
+      return this.handleLocalDoc(request, id);
+    }
+
+    const id = decodeURIComponent(parts.join("/"));
+    return this.handleDoc(request, id);
   }
 
   private rows<T>(query: string, ...args: unknown[]): T[] {
@@ -757,14 +763,16 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     return json({ ok: true });
   }
 
+  /**
+   * Deletes everything the vault holds. External copies (vectors, the FTS
+   * index in R2) go first and any failure there aborts the request: the
+   * SQLite rows stay, so the caller can retry instead of ending up with an
+   * orphaned index that nothing can reach any more.
+   */
   private async deleteDb(): Promise<Response> {
     await this.removeAllVectors();
     const ref = this.vaultRef();
-    if (ref) {
-      await deleteFtsIndex(this.bindings().bucket, ref).catch((error) =>
-        console.warn("FTS index cleanup failed", error),
-      );
-    }
+    if (ref) await deleteFtsIndex(this.bindings().bucket, ref);
     this.ctx.storage.sql.exec(`DELETE FROM docs`);
     this.ctx.storage.sql.exec(`DELETE FROM rev_body_chunks`);
     this.ctx.storage.sql.exec(`DELETE FROM rev_metadata`);
