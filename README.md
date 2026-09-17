@@ -24,6 +24,8 @@ Built for [Kuro](https://usekuro.app). Available to everyone.
 
 Notes written through MCP are regular LiveSync revisions, so they show up in Obsidian on the next sync.
 
+The server also sends MCP `instructions` telling assistants to read `AGENTS.md` at the vault root first, if it exists. Put your vault's layout and the rules you want agents to follow (where daily notes live, how to mark AI-written text, …) in that note and every connected assistant will see them before touching the vault.
+
 ## Deploy
 
 ### Option A: Deploy to Cloudflare button

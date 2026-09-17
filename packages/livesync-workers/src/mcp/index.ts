@@ -23,6 +23,32 @@ export type VaultToolContext = {
   vaultLabel?: string;
 };
 
+export type VaultInstructionsOptions = {
+  /** Name shown in the instructions. Default "Obsidian". */
+  vaultLabel?: string;
+  /** Extra paragraphs appended after the vault guidance (e.g. for host-specific tools). */
+  extra?: string[];
+};
+
+/**
+ * Server-level `instructions` for the MCP `initialize` response. Clients such as
+ * Claude Code and Claude.ai put this text in the model's system prompt, so it is the
+ * one place a vault owner's `AGENTS.md` can be surfaced before any tool is called.
+ *
+ * Pass the result as `new McpServer(info, { instructions: vaultInstructions() })`.
+ */
+export function vaultInstructions(options: VaultInstructionsOptions = {}): string {
+  const label = options.vaultLabel ?? "Obsidian";
+  const paragraphs = [
+    `This server gives access to the user's ${label} vault: a folder of Markdown notes.`,
+    `Before doing anything else with the vault, call readNote with path "AGENTS.md". If it exists, it is the vault owner's guide for AI agents: how the vault is organized, where daily notes live, and the conventions to follow when writing or appending to notes. Follow it. If readNote reports NOT_FOUND, there is no such guide; continue without it and do not create one unless asked.`,
+    `Searching: grepNotes is an exact-match full-text search (substring for Japanese/CJK, whole-word for ASCII) and is the better choice for names, terms and Japanese keywords; searchNotes is semantic and better for vague or conceptual queries. Paths are vault-relative (e.g. "Projects/Plan.md"); readNote suggests similar paths when it misses.`,
+    `Writing: prefer appendToDailyNote / appendToNote when adding to a note is enough. writeNote overwrites and needs the contentHash from readNote for existing notes. Write tools also require the vault:append / vault:write scopes, which the user may not have granted.`,
+    ...(options.extra ?? []),
+  ];
+  return paragraphs.join("\n\n");
+}
+
 function textResult(value: unknown) {
   return {
     content: [
