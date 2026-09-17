@@ -17,6 +17,12 @@ export type OAuthPrincipal = {
   label?: string;
   /** Extra props merged into the access token. */
   props?: Record<string, unknown>;
+  /**
+   * Names of the scopes this principal may be offered. Omit to offer every
+   * scope. Required scopes are always kept. Used for both rendering the
+   * consent page and validating the submitted form.
+   */
+  scopes?: string[];
 };
 
 export type VaultOAuthOptions<Env> = {
@@ -104,10 +110,18 @@ async function csrfValid(secret: string, nonce: string | undefined, token: strin
   return constantTimeEquals(await sha256Hex(`${secret}:${nonce}`), token);
 }
 
+/** Scopes a principal may be offered: `principal.scopes` when set, every scope otherwise. */
+export function scopesForPrincipal(
+  scopes: OAuthScopeSpec[],
+  principal: OAuthPrincipal,
+): OAuthScopeSpec[] {
+  if (!principal.scopes) return scopes;
+  const allowed = new Set(principal.scopes);
+  return scopes.filter((s) => s.required || allowed.has(s.name));
+}
+
 function consentHandler<Env>(options: VaultOAuthOptions<Env>): ExportedHandler<Env> {
   const requiredScopes = options.scopes.filter((s) => s.required).map((s) => s.name);
-  const allScopes = options.scopes.map((s) => s.name);
-  const defaultScopes = options.scopes.filter((s) => s.required || s.default).map((s) => s.name);
   const descriptions = new Map(options.scopes.map((s) => [s.name, s.description]));
   const lang = options.consent?.lang ?? "en";
   const title = options.consent?.title ?? `Authorize ${options.resourceName}`;
@@ -154,6 +168,13 @@ function consentHandler<Env>(options: VaultOAuthOptions<Env>): ExportedHandler<E
         );
       }
 
+      // Scopes this user may be granted at all (the host can narrow them per
+      // principal, e.g. by plan or feature flag).
+      const principalScopes = scopesForPrincipal(options.scopes, principal);
+      const allScopes = principalScopes.map((s) => s.name);
+      const defaultScopes = principalScopes
+        .filter((s) => s.required || s.default)
+        .map((s) => s.name);
       // Many MCP clients request no scope at all; offer every supported
       // scope then, or only what the client asked for otherwise.
       const requestedScopes = authRequest.scope.filter((scope) => allScopes.includes(scope));

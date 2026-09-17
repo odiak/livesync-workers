@@ -102,4 +102,7 @@ registerVaultTools(this.server, {
 
 `createVaultOAuthProvider` gives you the consent page and OAuth endpoints; pass
 `authenticate` (your session lookup) and `loginRedirect`, and extend `scopes`
-with any of your own.
+with any of your own. To offer a subset per user (a plan or feature flag),
+return `scopes: [...]` from `authenticate`; the consent page shows only those
+(plus required scopes) and the submitted form is validated against the same
+list.
