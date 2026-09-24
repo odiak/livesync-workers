@@ -18,6 +18,12 @@ export type VaultPolicy = {
   excludedFolders: string[];
   /** IANA time zone used to resolve "today" for daily notes. */
   timeZone: string;
+  /**
+   * Also leave hidden paths (any folder or file name starting with ".", such as
+   * ".obsidian/" or ".trash/") out of the search indexes. They stay readable.
+   * Default false.
+   */
+  excludeHiddenPaths?: boolean;
 };
 
 export const DEFAULT_VAULT_POLICY: VaultPolicy = {
@@ -43,6 +49,52 @@ export interface VaultHost {
   serverName?: string;
 }
 
+/** A note as handed to a {@link FullTextIndex}. */
+export type FullTextNote = {
+  path: string;
+  content: string;
+  /** sha256 hex of `content`. */
+  contentHash: string;
+  /** Obsidian mtime (ms), when the note carries one. */
+  mtime: number | null;
+};
+
+export type FullTextSearchHit = {
+  path: string;
+  score: number;
+  matchCount: number;
+  snippets: Array<{ before: string; match: string; after: string }>;
+};
+
+/** Writes for one indexing pass; `close` is always called at the end of the pass. */
+export interface FullTextIndexWriter {
+  upsert(note: FullTextNote): Promise<void>;
+  delete(path: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * An externally stored full-text index kept up to date one note at a time
+ * (e.g. a search database). Replaces the built-in R2 index, which is rebuilt
+ * in full inside the Durable Object.
+ */
+export interface FullTextIndex {
+  /** Called lazily once per indexing pass that has something to write. */
+  openWriter(ref: VaultRef): Promise<FullTextIndexWriter>;
+  search(
+    ref: VaultRef,
+    query: string,
+    limit: number,
+  ): Promise<{
+    hits: FullTextSearchHit[];
+    /** Time of the newest index write (ms); 0 when unknown. */
+    builtAt: number;
+    docCount: number;
+  }>;
+  /** Drop everything indexed for the vault (the vault is being deleted). */
+  deleteVault(ref: VaultRef): Promise<void>;
+}
+
 /** Text embedding provider for semantic search. */
 export interface Embedder {
   embed(texts: string[]): Promise<number[][]>;
@@ -57,12 +109,32 @@ export interface Embedder {
 export type VectorIsolation = "namespace" | "metadata";
 
 /** Cloudflare resources the library needs. Names are the host's choice. */
+/**
+ * A Durable Object namespace of any class. `wrangler types` generates
+ * `DurableObjectNamespace<YourVaultDO>`, which a plain `DurableObjectNamespace`
+ * does not accept.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AnyDurableObjectNamespace = DurableObjectNamespace<any>;
+
 export interface VaultBindings {
-  vaultDb: DurableObjectNamespace;
+  vaultDb: AnyDurableObjectNamespace;
   vectorize: VectorizeIndex;
-  bucket: R2Bucket;
+  /** Holds the built-in full-text index. Required unless `fullText` is given. */
+  bucket?: R2Bucket;
   embedder: Embedder;
   vectorIsolation?: VectorIsolation;
+  /**
+   * External full-text index, updated per note as the vault changes. When set,
+   * the built-in R2 index is not used at all.
+   */
+  fullText?: FullTextIndex;
+  /**
+   * Durable Object name for a vault. Default {@link vaultObjectName}
+   * (`${tenantId}:${databaseName}`). A host that changes it must also override
+   * `LiveSyncVaultDO.vaultRef()`, which otherwise parses the default name.
+   */
+  objectName?: (ref: VaultRef) => string;
 }
 
 export type DailyNoteSettings = {
@@ -78,6 +150,11 @@ export function parseVaultObjectName(name: string): VaultRef | null {
   const index = name.indexOf(":");
   if (index <= 0) return null;
   return { tenantId: name.slice(0, index), databaseName: name.slice(index + 1) };
+}
+
+/** Whether any folder or file name in the path starts with "." (".obsidian/…", ".trash/…"). */
+export function isHiddenPath(path: string): boolean {
+  return path.split("/").some((segment) => segment.startsWith("."));
 }
 
 export function isReservedPath(path: string, reservedPaths: string[]): boolean {

@@ -7,10 +7,13 @@ import { extractSnippet } from "../search/fts/search.js";
 import {
   isReservedPath,
   type DailyNoteSettings,
+  type FullTextSearchHit,
   type VaultBindings,
   type VaultPolicy,
   type VaultRef,
 } from "../types.js";
+
+export type { FullTextSearchHit };
 
 export type WriteVaultNoteResult =
   | { ok: true; path: string }
@@ -36,13 +39,8 @@ export type VaultIndexStatus = {
   indexed: number;
   pending: number;
   fts?: { generation: string | null; rebuildAt: number | null };
-};
-
-export type FullTextSearchHit = {
-  path: string;
-  score: number;
-  matchCount: number;
-  snippets: Array<{ before: string; match: string; after: string }>;
+  /** Progress of an external full-text index (`VaultBindings.fullText`), per note. */
+  fullText?: { indexed: number; pending: number };
 };
 
 export type FullTextSearchResult =
@@ -78,7 +76,10 @@ export interface Vault {
   ): Promise<AppendVaultNoteResult>;
   /** Semantic search over indexed notes. */
   search(query: string, topK: number): Promise<VectorSearchHit[]>;
-  /** Exact-match full-text search. Kicks off a rebuild when no index exists yet. */
+  /**
+   * Exact-match full-text search. With the built-in R2 index, kicks off a
+   * rebuild when no index exists yet.
+   */
   grep(query: string, limit: number): Promise<FullTextSearchResult>;
   dailyNoteSettings(): Promise<DailyNoteSettings | undefined>;
   indexStatus(): Promise<VaultIndexStatus>;
@@ -119,12 +120,16 @@ class VaultClient implements Vault {
     return new VaultClient(this.bindings, this.options, false);
   }
 
+  private stub(): DurableObjectStub {
+    return vaultStub(this.bindings.vaultDb, this.ref, this.bindings.objectName);
+  }
+
   private hidden(path: string): boolean {
     return this.restricted && isReservedPath(path, this.policy.reservedPaths);
   }
 
   private async internalResponse(body: Record<string, unknown>): Promise<Response> {
-    return vaultStub(this.bindings.vaultDb, this.ref).fetch(
+    return this.stub().fetch(
       new Request("https://livesync-db/internal/op", {
         method: "POST",
         headers: {
@@ -143,7 +148,7 @@ class VaultClient implements Vault {
   }
 
   async exists(): Promise<boolean> {
-    const res = await vaultStub(this.bindings.vaultDb, this.ref).fetch(
+    const res = await this.stub().fetch(
       new Request("https://livesync-db/", { method: "HEAD" }),
     );
     return res.status === 200;
@@ -223,11 +228,22 @@ class VaultClient implements Vault {
   }
 
   async grep(query: string, limit: number): Promise<FullTextSearchResult> {
-    const result = await ftsSearch(this.bindings.bucket, this.ref, query, limit);
+    if (this.bindings.fullText) {
+      const result = await this.bindings.fullText.search(this.ref, query, limit);
+      return {
+        status: "ready",
+        hits: result.hits.filter((hit) => !this.hidden(hit.path)),
+        builtAt: result.builtAt,
+        docCount: result.docCount,
+      };
+    }
+    const bucket = this.bindings.bucket;
+    if (!bucket) throw new Error("VaultBindings needs either bucket or fullText");
+    const result = await ftsSearch(bucket, this.ref, query, limit);
     if (result.status === "not-built") {
       await this.internalResponse({ op: "ftsRebuild" });
       // The last phase marker the rebuild reached; survives DO resets.
-      const debug = await readFtsPhase(this.bindings.bucket, this.ref);
+      const debug = await readFtsPhase(bucket, this.ref);
       return { status: "building", debug };
     }
     const hits = result.hits.filter((hit) => !this.hidden(hit.path));
@@ -276,7 +292,7 @@ class VaultClient implements Vault {
   }
 
   async purge(): Promise<void> {
-    const res = await vaultStub(this.bindings.vaultDb, this.ref).fetch(
+    const res = await this.stub().fetch(
       new Request("https://livesync-db/internal/purge", {
         method: "POST",
         headers: { [INTERNAL_SECRET_HEADER]: this.options.internalSecret },

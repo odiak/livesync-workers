@@ -12,8 +12,11 @@ import {
   secretEquals,
 } from "../livesync/http.js";
 import {
+  isHiddenPath,
   isReservedPath,
   parseVaultObjectName,
+  type FullTextIndex,
+  type FullTextIndexWriter,
   type VaultBindings,
   type VaultHost,
   type VaultPolicy,
@@ -84,6 +87,8 @@ type IndexStateRow = {
   chunks: number;
   pending: number;
   attempts: number;
+  /** Content hash last written to the external full-text index (null = not there yet). */
+  fts_hash: string | null;
 };
 
 type InternalOp = {
@@ -112,6 +117,10 @@ const FTS_REBUILD_RETRY_MS = 60_000;
 // limit, so refuse pathological inputs instead of burning the isolate.
 const FTS_MAX_TOTAL_BYTES = 50_000_000;
 const FTS_MAX_NOTE_BYTES = 2_000_000;
+// External full-text index (VaultBindings.fullText): notes already
+// vector-indexed but not yet written there (a fresh setup, or after
+// "ftsRebuild") are backfilled this many per alarm run.
+const FTS_BACKLOG_BATCH_SIZE = 50;
 // Chunk documents written by the server. The hash salt is a persisted format
 // detail (chunk ids are content addressed); keep it stable.
 const WRITE_CHUNK_PREFIX = "h:";
@@ -150,7 +159,9 @@ function isIndexableMarkdownPath(path: string, policy: VaultPolicy): boolean {
   return (
     path.endsWith(".md") &&
     !isReservedPath(path, policy.reservedPaths) &&
-    !isExcludedByFolders(path, policy.excludedFolders)
+    !isExcludedByFolders(path, policy.excludedFolders) &&
+    // "i:" marks files LiveSync's hidden file sync carries (".obsidian/…").
+    !(policy.excludeHiddenPaths && (path.startsWith("i:") || isHiddenPath(path)))
   );
 }
 
@@ -630,6 +641,13 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         attempts INTEGER NOT NULL DEFAULT 0
       )
     `);
+    const indexStateColumns = new Set(
+      sql.exec<{ name: string }>(`PRAGMA table_info(index_state)`).toArray().map((column) => column.name),
+    );
+    if (!indexStateColumns.has("fts_hash")) {
+      // Only used with an external full-text index; NULL rows get backfilled there.
+      sql.exec(`ALTER TABLE index_state ADD COLUMN fts_hash TEXT`);
+    }
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_revs_id ON revs (id)`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_revs_parent ON revs (id, parent_rev)`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_changes_id ON changes (id)`);
@@ -657,7 +675,9 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     if (
       Date.now() - this.lastIndexScheduleAt > 5_000 &&
       this.dbExists() &&
-      (this.indexNeedsVersionUpgrade() || this.indexedSeq() < this.currentSeq())
+      (this.indexNeedsVersionUpgrade() ||
+        this.indexedSeq() < this.currentSeq() ||
+        this.hasFullTextBacklog())
     ) {
       void this.scheduleIndexing();
     }
@@ -772,7 +792,11 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private async deleteDb(): Promise<Response> {
     await this.removeAllVectors();
     const ref = this.vaultRef();
-    if (ref) await deleteFtsIndex(this.bindings().bucket, ref);
+    if (ref) {
+      const fullText = this.bindings().fullText;
+      if (fullText) await fullText.deleteVault(ref);
+      else await deleteFtsIndex(this.ftsBucket(), ref);
+    }
     this.ctx.storage.sql.exec(`DELETE FROM docs`);
     this.ctx.storage.sql.exec(`DELETE FROM rev_body_chunks`);
     this.ctx.storage.sql.exec(`DELETE FROM rev_metadata`);
@@ -840,15 +864,27 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         return this.writeNote(body);
       case "reindex":
         this.setMeta(INDEXED_SEQ_META_KEY, "0");
-        this.armFtsRebuild(0);
+        this.requestFullTextRebuild();
         await this.scheduleIndexing(0);
         return json({ ok: true });
       case "ftsRebuild":
-        this.armFtsRebuild(0);
+        this.requestFullTextRebuild();
         await this.scheduleIndexing(0);
         return json({ ok: true });
       case "indexStatus":
         return json({
+          ...(this.externalFullText()
+            ? {
+                fullText: {
+                  indexed: this.first<{ count: number }>(
+                    `SELECT COUNT(*) AS count FROM index_state WHERE fts_hash IS NOT NULL`,
+                  )?.count ?? 0,
+                  pending: this.first<{ count: number }>(
+                    `SELECT COUNT(*) AS count FROM index_state WHERE fts_hash IS NULL`,
+                  )?.count ?? 0,
+                },
+              }
+            : {}),
           indexedSeq: this.indexedSeq(),
           currentSeq: this.currentSeq(),
           indexed: this.first<{ count: number }>(
@@ -1131,6 +1167,16 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     );
     const ids = new Set(changes.map((change) => change.id));
     const pendingRows = this.rows<IndexStateRow>(`SELECT * FROM index_state WHERE pending = 1`);
+    const fullText = this.bindings().fullText;
+    // Vector-indexed notes not yet in the external full-text index.
+    const fullTextBacklog = fullText
+      ? this.rows<IndexStateRow>(
+          `SELECT * FROM index_state
+           WHERE fts_hash IS NULL AND pending = 0 AND hash IS NOT NULL AND doc_id IS NOT NULL
+           ORDER BY path LIMIT ?`,
+          FTS_BACKLOG_BATCH_SIZE,
+        )
+      : [];
 
     // Paths whose winning doc changed in this batch.
     const touchedPaths = new Map<string, RevRow | null>();
@@ -1165,6 +1211,61 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         touchedPaths.set(pending.path, this.findNoteRow(pending.path));
       }
     }
+    for (const backlog of fullTextBacklog) {
+      if (touchedPaths.has(backlog.path)) continue;
+      // doc_id is known here, so skip findNoteRow's JSON-scan fallback.
+      const raw = this.rawWinningRow(backlog.doc_id!);
+      const row = raw && !raw.deleted ? this.hydrateRevision(raw) : null;
+      touchedPaths.set(backlog.path, row && !docIsDeleted(cloneBody(row)) ? row : null);
+    }
+
+    // One writer per run, opened on first use. A failed write leaves the note
+    // pending so a later run retries it; the vectors are kept either way.
+    let writer: Promise<FullTextIndexWriter> | undefined;
+    const writeFullText = async (
+      path: string,
+      work: (writer: FullTextIndexWriter) => Promise<void>,
+    ): Promise<boolean> => {
+      try {
+        writer ??= fullText!.openWriter(ref);
+        await work(await writer);
+        return true;
+      } catch (error) {
+        console.warn("Full-text index write failed", { path, error });
+        return false;
+      }
+    };
+
+    let retry = false;
+    try {
+      retry = await this.indexTouchedPaths(touchedPaths, { ref, policy, fullText, writeFullText });
+    } finally {
+      if (writer) await writer.then((opened) => opened.close()).catch(() => undefined);
+    }
+
+    const lastSeq = changes.at(-1)?.seq ?? since;
+    if (lastSeq > since) {
+      this.setMeta(INDEXED_SEQ_META_KEY, String(lastSeq));
+      if (!fullText) this.armFtsRebuild(FTS_REBUILD_DEBOUNCE_MS);
+    }
+    return {
+      more: changes.length >= INDEX_BATCH_SIZE || fullTextBacklog.length >= FTS_BACKLOG_BATCH_SIZE,
+      retry,
+      worked: changes.length > 0,
+    };
+  }
+
+  /** Brings vectors (and the external full-text index, if any) up to date for these notes. Returns whether to retry later. */
+  private async indexTouchedPaths(
+    touchedPaths: Map<string, RevRow | null>,
+    options: {
+      ref: VaultRef;
+      policy: VaultPolicy;
+      fullText: FullTextIndex | undefined;
+      writeFullText: (path: string, work: (writer: FullTextIndexWriter) => Promise<void>) => Promise<boolean>;
+    },
+  ): Promise<boolean> {
+    const { ref, policy, fullText, writeFullText } = options;
     let retry = false;
     for (const [path, row] of touchedPaths) {
       const state = this.first<IndexStateRow>(`SELECT * FROM index_state WHERE path = ?`, path);
@@ -1172,6 +1273,15 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       if (!indexable) {
         if (state) {
           await removeNoteVectors(this.bindings(), { ref, path, chunks: state.chunks });
+          if (fullText && state.fts_hash != null && !(await writeFullText(path, (w) => w.delete(path)))) {
+            // Keep the row so the deletion is retried; only the vectors are gone.
+            this.ctx.storage.sql.exec(
+              `UPDATE index_state SET chunks = 0, pending = 1, attempts = attempts + 1 WHERE path = ?`,
+              path,
+            );
+            retry = true;
+            continue;
+          }
           this.ctx.storage.sql.exec(`DELETE FROM index_state WHERE path = ?`, path);
         }
         continue;
@@ -1195,37 +1305,125 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         continue;
       }
       const hash = await hashText(content);
-      if (state && !state.pending && state.hash === hash) continue;
-      const chunks = await upsertNoteVectors(this.bindings(), {
-        ref,
-        path,
-        content,
-        hash,
-        previousChunks: state?.chunks ?? 0,
-      });
+      if (!fullText) {
+        if (state && !state.pending && state.hash === hash) continue;
+        const chunks = await upsertNoteVectors(this.bindings(), {
+          ref,
+          path,
+          content,
+          hash,
+          previousChunks: state?.chunks ?? 0,
+        });
+        this.ctx.storage.sql.exec(
+          `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts)
+           VALUES (?, ?, ?, ?, 0, 0)
+           ON CONFLICT(path) DO UPDATE SET
+             doc_id = excluded.doc_id, hash = excluded.hash, chunks = excluded.chunks,
+             pending = 0, attempts = 0`,
+          path,
+          row.id,
+          hash,
+          chunks,
+        );
+        continue;
+      }
+
+      // Vectors and the full-text index are tracked separately, so a failure
+      // in one does not redo the other.
+      const vectorsCurrent = state?.hash === hash;
+      const fullTextCurrent = state?.fts_hash === hash;
+      if (state && !state.pending && vectorsCurrent && fullTextCurrent) continue;
+      const chunks = vectorsCurrent
+        ? state!.chunks
+        : await upsertNoteVectors(this.bindings(), {
+            ref,
+            path,
+            content,
+            hash,
+            previousChunks: state?.chunks ?? 0,
+          });
+      let ftsHash = state?.fts_hash ?? null;
+      let ftsFailed = false;
+      if (!fullTextCurrent) {
+        const oversized = content.length > FTS_MAX_NOTE_BYTES;
+        if (oversized) console.warn("Full-text index skipping oversized note", { path });
+        const ok = await writeFullText(path, (w) =>
+          oversized
+            ? w.delete(path)
+            : w.upsert({ path, content, contentHash: hash, mtime: this.noteMtimeForRow(row) }),
+        );
+        if (ok) ftsHash = hash;
+        else ftsFailed = true;
+      }
       this.ctx.storage.sql.exec(
-        `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts)
-         VALUES (?, ?, ?, ?, 0, 0)
+        `INSERT INTO index_state (path, doc_id, hash, fts_hash, chunks, pending, attempts)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
-           doc_id = excluded.doc_id, hash = excluded.hash, chunks = excluded.chunks,
-           pending = 0, attempts = 0`,
+           doc_id = excluded.doc_id, hash = excluded.hash, fts_hash = excluded.fts_hash,
+           chunks = excluded.chunks, pending = excluded.pending,
+           attempts = CASE WHEN excluded.pending = 1 THEN index_state.attempts + 1 ELSE 0 END`,
         path,
         row.id,
         hash,
+        ftsHash,
         chunks,
+        ftsFailed ? 1 : 0,
+        ftsFailed ? 1 : 0,
       );
+      if (ftsFailed) retry = true;
     }
+    return retry;
+  }
 
-    const lastSeq = changes.at(-1)?.seq ?? since;
-    if (lastSeq > since) {
-      this.setMeta(INDEXED_SEQ_META_KEY, String(lastSeq));
-      this.armFtsRebuild(FTS_REBUILD_DEBOUNCE_MS);
+  /** Whether notes still wait for the external full-text index (never with the built-in one). */
+  private hasFullTextBacklog(): boolean {
+    if (!this.externalFullText()) return false;
+    return (
+      this.first<{ n: number }>(
+        `SELECT 1 AS n FROM index_state
+         WHERE fts_hash IS NULL AND pending = 0 AND hash IS NOT NULL LIMIT 1`,
+      ) != null
+    );
+  }
+
+  /** Re-send every note to the full-text index (external: per note; built-in: one rebuild). */
+  private requestFullTextRebuild(): void {
+    if (this.externalFullText()) {
+      // Resetting attempts also revives notes that gave up while the index was unreachable.
+      this.ctx.storage.sql.exec(`UPDATE index_state SET fts_hash = NULL, attempts = 0`);
+    } else {
+      this.armFtsRebuild(0);
     }
-    return {
-      more: changes.length >= INDEX_BATCH_SIZE,
-      retry,
-      worked: changes.length > 0,
-    };
+  }
+
+  /**
+   * The host's external full-text index, if any. Paths that never looked at
+   * bindings before it existed treat a failing bindings() as "none", so they
+   * keep behaving as they did.
+   */
+  private externalFullText(): FullTextIndex | undefined {
+    try {
+      return this.bindings().fullText;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private noteMtimeForRow(row: RevRow): number | null {
+    const meta = this.first<{ mtime: number | null }>(
+      `SELECT mtime FROM rev_metadata WHERE id = ? AND rev = ?`,
+      row.id,
+      row.rev,
+    );
+    if (meta?.mtime != null) return meta.mtime;
+    const mtime = cloneBody(row).mtime;
+    return typeof mtime === "number" ? mtime : null;
+  }
+
+  private ftsBucket(): R2Bucket {
+    const bucket = this.bindings().bucket;
+    if (!bucket) throw new Error("VaultBindings needs either bucket or fullText");
+    return bucket;
   }
 
   // ---------------------------------------------------------------------
@@ -1237,7 +1435,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   private async maybeRunFtsRebuild(): Promise<void> {
-    if (!this.vaultRef() || !this.dbExists()) return;
+    if (!this.vaultRef() || !this.dbExists() || this.externalFullText()) return;
     const dueRaw = this.getMeta(FTS_REBUILD_AT_META_KEY);
     let due = dueRaw ? Number(dueRaw) : null;
     if (due == null) {
@@ -1297,7 +1495,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private async runFtsRebuild(): Promise<void> {
     const ref = this.vaultRef();
     if (!ref) return;
-    const bucket = this.bindings().bucket;
+    const bucket = this.ftsBucket();
     await markFtsPhase(bucket, ref, "gather-start");
     const policy = await this.loadPolicy(ref);
     const docs: FtsDocInput[] = [];

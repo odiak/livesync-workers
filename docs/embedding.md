@@ -30,6 +30,8 @@ export function myHost(env: Env): VaultHost {
         reservedPaths: [".myapp"],           // hidden from MCP and the vault client
         excludedFolders: await excludedFolders(env.DB, ref.tenantId),
         timeZone: await userTimeZone(env.DB, ref.tenantId),
+        // Optional: also keep ".obsidian/", ".trash/" and other hidden paths out of search.
+        excludeHiddenPaths: true,
       };
     },
     internalSecret: env.INTERNAL_SECRET,
@@ -74,6 +76,53 @@ Bind it as a SQLite-backed class (`new_sqlite_classes`). The object name is
 ```ts
 if (url.pathname.startsWith("/livesync")) {
   return handleLiveSyncRequest(request, { host: myHost(env), bindings: myBindings(env) });
+}
+```
+
+### Optional: an external full-text index
+
+By default full-text search uses an index the Durable Object rebuilds in full
+and stores in R2 (`bucket`). That rebuild holds the whole vault in memory, so
+for large vaults, or to search from your own database, pass `fullText` instead;
+`bucket` can then be left out.
+
+```ts
+import type { FullTextIndex } from "livesync-workers";
+
+const fullText: FullTextIndex = {
+  // One writer per indexing pass; close() is always called.
+  async openWriter(ref) {
+    const db = await connect(env);
+    return {
+      upsert: (note) => db.upsertNote(ref, note), // { path, content, contentHash, mtime }
+      delete: (path) => db.deleteNote(ref, path),
+      close: () => db.end(),
+    };
+  },
+  search: (ref, query, limit) => searchNotes(env, ref, query, limit), // { hits, builtAt, docCount }
+  deleteVault: (ref) => deleteAllNotes(env, ref),
+};
+
+return { vaultDb: env.VAULT_DB, vectorize: env.VECTORIZE, embedder, fullText };
+```
+
+Notes are sent one at a time as they change, tracked separately from the
+vectors: a failed write is retried later without embedding the note again.
+Switching an existing vault over backfills every note (`indexStatus().fullText`
+shows the progress), and the `ftsRebuild` / `reindex` operations re-send them all.
+
+### Optional: Durable Object names
+
+Objects are named `${tenantId}:${databaseName}` unless `objectName` says
+otherwise, e.g. to keep a vault created under another name:
+
+```ts
+return { ...bindings, objectName: () => "knowledge" };
+
+export class VaultDO extends LiveSyncVaultDO<Env> {
+  // The default parses the object name, so say which vault this is.
+  protected vaultRef() { return { tenantId: "team", databaseName: "knowledge" }; }
+  // host() and bindings() as above
 }
 ```
 

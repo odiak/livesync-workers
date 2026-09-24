@@ -7,11 +7,17 @@ import {
   jsonHeaders,
   numberParam,
 } from "./http.js";
-import { vaultObjectName, type VaultBindings, type VaultHost, type VaultRef } from "../types.js";
+import {
+  vaultObjectName,
+  type AnyDurableObjectNamespace,
+  type VaultBindings,
+  type VaultHost,
+  type VaultRef,
+} from "../types.js";
 
 export type LiveSyncHandlerOptions = {
   host: VaultHost;
-  bindings: Pick<VaultBindings, "vaultDb">;
+  bindings: Pick<VaultBindings, "vaultDb" | "objectName">;
   /** URL prefix the CouchDB API is served under. Default "/livesync". */
   prefix?: string;
 };
@@ -46,6 +52,8 @@ function corsHeaders(request: Request, host: VaultHost): HeadersInit | null {
     "Access-Control-Allow-Headers":
       "authorization,content-type,accept,origin,referer,x-couch-full-commit",
     "Access-Control-Expose-Headers": "etag",
+    // Let clients cache the preflight instead of sending OPTIONS before every _changes poll.
+    "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
   if (!origin) return { ...base, "Access-Control-Allow-Origin": "*" };
@@ -373,8 +381,14 @@ function continuousChangesProxy(
 }
 
 /** Stub for the Durable Object holding a vault. */
-export function vaultStub(vaultDb: DurableObjectNamespace, ref: VaultRef): DurableObjectStub {
-  return vaultDb.get(vaultDb.idFromName(vaultObjectName(ref)));
+export function vaultStub(
+  vaultDb: AnyDurableObjectNamespace,
+  ref: VaultRef,
+  objectName: (ref: VaultRef) => string = vaultObjectName,
+): DurableObjectStub {
+  // Only fetch() is used, so the class-typed stub is not needed (and expensive to instantiate).
+  const namespace = vaultDb as DurableObjectNamespace;
+  return namespace.get(namespace.idFromName(objectName(ref)));
 }
 
 /**
@@ -382,6 +396,25 @@ export function vaultStub(vaultDb: DurableObjectNamespace, ref: VaultRef): Durab
  * Mount it for every request whose path starts with `prefix`.
  */
 export async function handleLiveSyncRequest(
+  request: Request,
+  options: LiveSyncHandlerOptions,
+): Promise<Response> {
+  try {
+    return await routeLiveSyncRequest(request, options);
+  } catch (error) {
+    // An escaping exception becomes the platform's error page without CORS
+    // headers, which the plugin reports as a CORS problem. Answer with a
+    // CouchDB-style 500 the client can show and retry instead.
+    console.warn("LiveSync request failed", error);
+    return withCors(
+      request,
+      options.host,
+      couchError(500, "internal_server_error", "Internal server error"),
+    );
+  }
+}
+
+async function routeLiveSyncRequest(
   request: Request,
   options: LiveSyncHandlerOptions,
 ): Promise<Response> {
@@ -473,7 +506,7 @@ export async function handleLiveSyncRequest(
   rewritten.pathname = dbPath;
   const headers = new Headers(request.headers);
   headers.set(DB_NAME_HEADER, decodedDbName);
-  const stub = vaultStub(options.bindings.vaultDb, auth!.ref);
+  const stub = vaultStub(options.bindings.vaultDb, auth!.ref, options.bindings.objectName);
   if (dbPath === "/_changes" && (request.method === "GET" || request.method === "POST")) {
     return withCors(
       request,
