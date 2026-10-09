@@ -119,6 +119,10 @@ export type AnyDurableObjectNamespace = DurableObjectNamespace<any>;
 
 export interface VaultBindings {
   vaultDb: AnyDurableObjectNamespace;
+  /** Optional R2 store for large LiveSync leaf revision bodies. Applies to every new write. */
+  chunkBucket?: R2Bucket;
+  /** UTF-8 bytes of the serialized leaf revision body. Default 64 KiB. */
+  chunkBodyThresholdBytes?: number;
   /**
    * Vector index for semantic search. Leave `vectorize` and `embedder` both
    * unset to run without semantic search: notes are still tracked and the

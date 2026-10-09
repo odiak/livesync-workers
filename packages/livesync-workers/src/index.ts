@@ -29,3 +29,6 @@ export {
 } from "./search/embedder.js";
 export { type VectorSearchHit } from "./search/vector-index.js";
 export * from "./credentials.js";
+
+export { DEFAULT_CHUNK_BODY_THRESHOLD_BYTES } from "./durable/chunk-body-store.js";
+export type { ChunkStorageStatus, ChunkMigrationProgress } from "./durable/chunk-body-store.js";
