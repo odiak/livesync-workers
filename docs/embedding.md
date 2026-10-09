@@ -136,6 +136,7 @@ const vault = createVault(myBindings(env), {
   internalSecret: env.INTERNAL_SECRET,
 });
 await vault.readNote("Projects/Plan.md");
+await vault.readFile("Projects/diagram.png"); // Uint8Array; attachments are decoded
 await vault.search("meeting notes", 8);
 vault.unrestricted(); // same vault without reservedPaths filtering, for host-internal use
 ```

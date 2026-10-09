@@ -1,6 +1,6 @@
 {
   "name": "livesync-workers",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Self-hosted LiveSync-compatible backend for Obsidian with search and MCP, for Cloudflare Workers",
   "license": "MIT",
   "type": "module",

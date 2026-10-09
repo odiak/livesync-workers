@@ -193,6 +193,68 @@ describe("LiveSync internal note access", () => {
     expect(returnedIds).toEqual(["wanted.md"]);
   });
 
+  it("lists every synced file except hidden internal files", async () => {
+    const { durableObject } = await created();
+    await replicate(durableObject, [
+      leafDoc("h:a", "# Hello\n"),
+      noteDoc("notes/hello.md", "1-n", "notes/hello.md", ["h:a"]),
+      noteDoc("images/a.png", "1-i", "images/a.png", ["h:a"], { type: "newnote" }),
+      noteDoc("i:.obsidian/plugins/x/readme.md", "1-p", "i:.obsidian/plugins/x/readme.md", ["h:a"]),
+      noteDoc("gone.png", "1-g", "gone.png", ["h:a"], { type: "newnote", deleted: true }),
+    ]);
+    const { files } = await json(await internalOp(durableObject, { op: "listFileStats" })) as {
+      files: Array<{ path: string }>;
+    };
+    expect(files.map((file) => file.path).sort()).toEqual(["images/a.png", "notes/hello.md"]);
+  });
+
+  it("reads binary files by decoding each base64 chunk separately", async () => {
+    const { durableObject } = await created();
+    const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
+    // 100-byte pieces end in "==" padding, so joining the strings would not decode.
+    const pieces = [bytes.subarray(0, 100), bytes.subarray(100, 200), bytes.subarray(200)]
+      .map((piece) => Buffer.from(piece).toString("base64"));
+    await replicate(durableObject, [
+      leafDoc("h:b1", pieces[0]!),
+      leafDoc("h:b2", pieces[1]!),
+      leafDoc("h:b3", pieces[2]!),
+      noteDoc("images/a.png", "1-i", "images/a.png", ["h:b1", "h:b2", "h:b3"], { type: "newnote" }),
+      noteDoc("inline.png", "1-d", "inline.png", [], { type: "newnote", data: pieces }),
+      noteDoc("text.md", "1-t", "text.md", [], { data: "日本語" }),
+      noteDoc("pending.png", "1-p", "pending.png", ["h:missing"], { type: "newnote" }),
+    ]);
+
+    for (const path of ["images/a.png", "inline.png"]) {
+      const response = await internalOp(durableObject, { op: "readFile", path });
+      expect(response.headers.get("Content-Type")).toBe("application/octet-stream");
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+    }
+    const text = await internalOp(durableObject, { op: "readFile", path: "text.md" });
+    expect(await text.text()).toBe("日本語");
+    for (const path of ["pending.png", "missing.png"]) {
+      expect((await internalOp(durableObject, { op: "readFile", path })).status).toBe(404);
+    }
+  });
+
+  it("reads binary files in LiveSync's legacy encoding", async () => {
+    const { durableObject } = await created();
+    const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
+    const encode = (piece: Uint8Array) =>
+      String.fromCharCode(...Array.from(piece, (b) =>
+        b >= 0x26 && b <= 0x7e && b !== 0x3a ? b : 0xc0 + b,
+      ));
+    await replicate(durableObject, [
+      noteDoc("legacy.png", "1-l", "legacy.png", [], {
+        type: "newnote",
+        data: [`%${encode(bytes.subarray(0, 128))}`, encode(bytes.subarray(128))],
+      }),
+      noteDoc("broken.png", "1-b", "broken.png", [], { type: "newnote", data: ["not base64!"] }),
+    ]);
+    const response = await internalOp(durableObject, { op: "readFile", path: "legacy.png" });
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+    expect((await internalOp(durableObject, { op: "readFile", path: "broken.png" })).status).toBe(404);
+  });
+
   it("lists note stats with mtime and size", async () => {
     const { durableObject } = await created();
     await replicate(durableObject, [

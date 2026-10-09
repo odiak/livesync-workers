@@ -74,6 +74,13 @@ export interface Vault {
   readNote(path: string): Promise<string | null>;
   /** Batch read; missing notes map to null. */
   readNotes(paths: string[]): Promise<Record<string, string | null>>;
+  /** Every synced file, attachments included (hidden "i:" files excluded). */
+  listFileStats(): Promise<VaultNoteStat[]>;
+  /**
+   * A file's bytes, decoding LiveSync's binary encoding for attachments.
+   * Null when the file is missing, still incomplete or cannot be decoded.
+   */
+  readFile(path: string): Promise<Uint8Array<ArrayBuffer> | null>;
   /**
    * Create or replace a note. `expectedBaseHash` is the sha256 of the content
    * being replaced ("" hashed for a new note); a mismatch yields CONFLICT.
@@ -201,6 +208,19 @@ class VaultClient implements Vault {
       paths: visible,
     });
     return { ...contents, ...payload.contents };
+  }
+
+  async listFileStats(): Promise<VaultNoteStat[]> {
+    const payload = await this.internal<{ files: VaultNoteStat[] }>({ op: "listFileStats" });
+    return payload.files.filter((file) => !this.hidden(file.path));
+  }
+
+  async readFile(path: string): Promise<Uint8Array<ArrayBuffer> | null> {
+    if (this.hidden(path)) return null;
+    const res = await this.internalResponse({ op: "readFile", path });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`LiveSync vault request failed (${res.status})`);
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   async writeNote(

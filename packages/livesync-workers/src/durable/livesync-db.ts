@@ -38,6 +38,7 @@ import {
   type VaultRef,
 } from "../types.js";
 
+import { decodeLiveSyncBinary } from "../vault/binary.js";
 import { ChunkBodyStore } from "./chunk-body-store.js";
 
 type DocBody = Record<string, unknown>;
@@ -986,6 +987,22 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
             .map((file) => ({ path: file.path, mtime: file.mtime, size: file.size })),
         });
       }
+      case "listFileStats": {
+        const missing = this.requireDb();
+        if (missing) return json({ files: [] });
+        return json({
+          files: this.listNoteFiles()
+            .filter((file) => !file.path.startsWith("i:"))
+            .map((file) => ({ path: file.path, mtime: file.mtime, size: file.size })),
+        });
+      }
+      case "readFile": {
+        const path = typeof body.path === "string" ? body.path : "";
+        const row = path && this.dbExists() ? this.findNoteRow(path) : null;
+        const bytes = row ? await this.fileBytesForRow(row) : null;
+        if (!bytes) return couchError(404, "not_found", "File not found or incomplete.");
+        return new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } });
+      }
       case "readNote": {
         const path = typeof body.path === "string" ? body.path : "";
         if (!path || !this.dbExists()) return json({ content: null });
@@ -1204,15 +1221,32 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
 
   /** Reassemble a note's content from inline data or child chunks. */
   private async fileContentForRow(row: RevRow): Promise<string | null> {
+    return (await this.filePieces(cloneBody(this.hydrateRevision(row))))?.join("") ?? null;
+  }
+
+  /**
+   * A file's raw bytes: UTF-8 for text documents, decoded pieces for binary
+   * ones. Null while chunks are missing or when a piece cannot be decoded.
+   */
+  private async fileBytesForRow(row: RevRow): Promise<Uint8Array | null> {
     const doc = cloneBody(this.hydrateRevision(row));
-    if (typeof doc.data === "string") return doc.data;
+    const pieces = await this.filePieces(doc);
+    if (!pieces) return null;
+    // LiveSync stores text as "plain" and everything else as base64 "newnote".
+    const text = doc.type === "plain" || doc.datatype === "plain";
+    return text ? new TextEncoder().encode(pieces.join("")) : decodeLiveSyncBinary(pieces);
+  }
+
+  /** The stored pieces of a file in order: inline data or child chunks. */
+  private async filePieces(doc: DocBody): Promise<string[] | null> {
+    if (typeof doc.data === "string") return [doc.data];
     if (Array.isArray(doc.data) && doc.data.every((piece) => typeof piece === "string")) {
-      return (doc.data as string[]).join("");
+      return doc.data as string[];
     }
     const children = Array.isArray(doc.children)
       ? doc.children.filter((id): id is string => typeof id === "string")
       : [];
-    if (children.length === 0) return typeof doc.children === "undefined" ? null : "";
+    if (children.length === 0) return typeof doc.children === "undefined" ? null : [];
 
     const eden =
       doc.eden && typeof doc.eden === "object"
@@ -1237,7 +1271,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       return typeof edenChunk?.data === "string" ? edenChunk.data : null;
     });
     return content.every((chunk): chunk is string => typeof chunk === "string")
-      ? content.join("")
+      ? content
       : null;
   }
 

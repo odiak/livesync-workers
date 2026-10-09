@@ -113,6 +113,27 @@ describe("Vault reserved paths", () => {
     ]);
   });
 
+  it("lists and reads attachments as bytes, hiding reserved paths", async () => {
+    const { vault, fetch } = vaultWith([
+      Response.json({
+        files: [
+          { path: "images/a.png", mtime: 1000, size: 3 },
+          { path: ".kuro/secret.png", mtime: 2000, size: 3 },
+        ],
+      }),
+      new Response(new Uint8Array([1, 2, 3])),
+      Response.json({ error: "not_found" }, { status: 404 }),
+    ]);
+    await expect(vault.listFileStats()).resolves.toEqual([
+      { path: "images/a.png", mtime: 1000, size: 3 },
+    ]);
+    await expect(vault.readFile("images/a.png")).resolves.toEqual(new Uint8Array([1, 2, 3]));
+    await expect(vault.readFile("images/missing.png")).resolves.toBe(null);
+    await expect(vault.readFile(".kuro/secret.png")).resolves.toBe(null);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    await expect(fetch.mock.calls[1]![0].json()).resolves.toEqual({ op: "readFile", path: "images/a.png" });
+  });
+
   it("blocks reserved notes from reads unless unrestricted", async () => {
     const { vault } = vaultWith(Response.json({ content: "# Memory" }));
     await expect(vault.readNote(".kuro/MEMORY.md")).resolves.toBe(null);
