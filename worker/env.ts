@@ -1,4 +1,7 @@
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+
 export interface Env {
+  OAUTH_PROVIDER?: OAuthHelpers;
   VAULT_DB: DurableObjectNamespace;
   MCP_OBJECT: DurableObjectNamespace;
   OAUTH_KV: KVNamespace;

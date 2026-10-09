@@ -22,6 +22,7 @@ import {
   isAdmin,
   safeRedirectTarget,
 } from "./auth.js";
+import { listMcpConnections } from "./mcp-connections.js";
 import { loginPage, statusPage } from "./pages.js";
 import { VaultMCP } from "./mcp.js";
 
@@ -85,6 +86,12 @@ const appHandler: ExportedHandler<Env> = {
       if (admin) {
         data.username = liveSyncUsername(env);
         try {
+          if (!env.OAUTH_PROVIDER) throw new Error("OAuth provider unavailable");
+          data.mcpConnections = await listMcpConnections(env.OAUTH_PROVIDER, "admin");
+        } catch {
+          data.mcpConnectionsError = true;
+        }
+        try {
           const vault = vaultFor(env);
           data.dbExists = await vault.exists();
           data.index = data.dbExists ? await vault.indexStatus() : null;
@@ -133,6 +140,7 @@ const oauthProvider = createVaultOAuthProvider<Env>({
   })),
   csrfSecret: (env) => requireSecret(env, "SESSION_SECRET"),
   resourceName: "livesync-workers vault",
+  refreshTokenTTL: null,
   consent: { title: "Allow access to your vault" },
 });
 

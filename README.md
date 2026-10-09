@@ -95,6 +95,8 @@ Point the client at `https://<your-worker>.workers.dev/mcp` (Streamable HTTP). I
 | `vault:append` | off | appendToDailyNote, appendToNote |
 | `vault:write` | off | writeNote |
 
+New MCP OAuth connections have no expiry (access tokens still expire after one hour and are refreshed). Existing connections retain their original expiry until you reconnect.
+
 Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>` instead once you add that secret (`wrangler secret put MCP_STATIC_TOKEN`, or in the dashboard under Settings → Variables and Secrets). The token grants `vault:read` only; add `vault:append` and/or `vault:write` through the `MCP_STATIC_TOKEN_SCOPES` variable. Tools apply the same scope checks as for OAuth grants.
 
 ## Configuration

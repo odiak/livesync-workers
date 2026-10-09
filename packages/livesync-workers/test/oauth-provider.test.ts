@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createVaultOAuthProvider } from "../src/oauth/index.js";
 
-function setup() {
+function setup(refreshTokenTTL?: number | null) {
   const store = new Map<string, string>();
   const kv = {
     async get(key: string, options?: { type?: string }) {
@@ -14,6 +14,7 @@ function setup() {
   };
   const env = { OAUTH_KV: kv as unknown as KVNamespace };
   const provider = createVaultOAuthProvider<typeof env>({
+    refreshTokenTTL,
     apiHandler: { fetch: async (_request, _env, ctx) => Response.json(
       (ctx as ExecutionContext & { props: unknown }).props,
     ) },
@@ -25,7 +26,7 @@ function setup() {
   });
   const ctx = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
   const fetch = (request: Request) => provider.fetch(request, env, { ...ctx });
-  return { fetch };
+  return { fetch, store };
 }
 
 const origin = "https://vault.example";
@@ -100,5 +101,44 @@ describe("OAuth provider token scope enforcement", () => {
       grant_type: "refresh_token", client_id: clientId, refresh_token: narrowed.refresh_token,
     });
     expect((await apiProps(fetch, restored.access_token)).scope).toEqual(["vault:read", "vault:write"]);
+  });
+});
+
+
+afterEach(() => vi.useRealTimers());
+
+describe("OAuth refresh token lifetime", () => {
+  it("keeps an indefinite grant refreshable after 31 days and rotates tokens", async () => {
+    vi.useFakeTimers();
+    const { fetch, store } = setup(null);
+    const { clientId, code } = await authorize(fetch);
+    const issued = await token(fetch, {
+      grant_type: "authorization_code", client_id: clientId, code, code_verifier: verifier, redirect_uri: callback,
+    });
+    const grant = () => JSON.parse([...store.entries()].find(([key]) => key.startsWith("grant:"))![1]);
+    expect(grant().expiresAt).toBeUndefined();
+    vi.setSystemTime(Date.now() + 31 * 86400000);
+    const refreshed = await token(fetch, {
+      grant_type: "refresh_token", client_id: clientId, refresh_token: issued.refresh_token,
+    });
+    expect(refreshed.refresh_token).not.toBe(issued.refresh_token);
+    expect(grant().expiresAt).toBeUndefined();
+    expect((await apiProps(fetch, refreshed.access_token)).userId).toBe("A");
+    expect(refreshed).toMatchObject({ expires_in: 3600 });
+  });
+
+  it("preserves the default 30-day expiry", async () => {
+    vi.useFakeTimers();
+    const { fetch } = setup();
+    const { clientId, code } = await authorize(fetch);
+    const issued = await token(fetch, {
+      grant_type: "authorization_code", client_id: clientId, code, code_verifier: verifier, redirect_uri: callback,
+    });
+    vi.setSystemTime(Date.now() + 31 * 86400000);
+    const response = await fetch(new Request(`${origin}/token`, {
+      method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: issued.refresh_token }),
+    }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_grant" });
   });
 });

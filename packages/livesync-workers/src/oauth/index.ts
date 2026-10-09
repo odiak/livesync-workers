@@ -48,7 +48,8 @@ export type VaultOAuthOptions<Env> = {
     lang?: string;
   };
   accessTokenTTL?: number;
-  refreshTokenTTL?: number;
+  /** Seconds; null means no expiry. Omitted defaults to 30 days. */
+  refreshTokenTTL?: number | null;
 };
 
 type ParsedAuthRequest = {
@@ -296,7 +297,7 @@ export function createVaultOAuthProvider<Env>(options: VaultOAuthOptions<Env>) {
     clientRegistrationEndpoint: "/register",
     scopesSupported,
     accessTokenTTL: options.accessTokenTTL ?? 60 * 60,
-    refreshTokenTTL: options.refreshTokenTTL ?? 60 * 60 * 24 * 30,
+    refreshTokenTTL: options.refreshTokenTTL === null ? undefined : options.refreshTokenTTL ?? 60 * 60 * 24 * 30,
     allowPlainPKCE: false,
     tokenExchangeCallback: ({ props, requestedScope }) => ({
       accessTokenProps: { ...props, scope: requestedScope },
