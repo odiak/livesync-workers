@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.4.0",
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "agents": "0.12.0",
     "ai": "6.0.172",
     "livesync-workers": "0.1.1",
@@ -70,6 +70,11 @@
       "SESSION_SECRET": {
         "description": "Signs admin session cookies and internal requests. Generate with `openssl rand -hex 32`."
       }
+    }
+  },
+  "overrides": {
+    "agents": {
+      "@modelcontextprotocol/sdk": "$@modelcontextprotocol/sdk"
     }
   }
 }
