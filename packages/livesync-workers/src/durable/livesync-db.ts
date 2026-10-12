@@ -1,3 +1,6 @@
+import { matchesSelector, matchesMetadata } from "./selector.js";
+import { mapBatches } from "../storage/concurrency.js";
+import { REQUEST_LIMITS, readBoundedJson, BadRequestError, RequestLimitError, assertBulkLimits, assertDocumentSize, decodePathSegment } from "../livesync/limits.js";
 import { hashText } from "../search/chunk-md.js";
 import { removeNoteVectors, upsertNoteVectors } from "../search/vector-index.js";
 import {
@@ -20,6 +23,7 @@ import type { FtsDocInput } from "../search/fts/build.js";
 import {
   CHANGES_IDLE_HEADER,
   DB_NAME_HEADER,
+  VAULT_REF_HEADER,
   INTERNAL_SECRET_HEADER,
   couchError,
   json,
@@ -30,6 +34,7 @@ import {
   isHiddenPath,
   isReservedPath,
   parseVaultObjectName,
+  vaultObjectName,
   type FullTextIndex,
   type FullTextIndexWriter,
   type VaultBindings,
@@ -185,19 +190,14 @@ const FTS_RESOLVE_MAX_CANDIDATES = 500;
 // External full-text index (VaultBindings.fullText): notes already
 // vector-indexed but not yet written there (a fresh setup, or after
 // "ftsRebuild") are backfilled this many per alarm run.
-const FTS_BACKLOG_BATCH_SIZE = 50;
 // Chunk documents written by the server. The hash salt is a persisted format
 // detail (chunk ids are content addressed); keep it stable.
 const WRITE_CHUNK_PREFIX = "h:";
 const WRITE_CHUNK_HASH_SALT = "kuro-chunk";
 const WRITE_CHUNK_CODE_UNITS = 100_000;
 
-async function mapBatched<T, U>(items: T[], map: (item: T) => Promise<U>): Promise<U[]> {
-  const results: U[] = [];
-  for (let i = 0; i < items.length; i += 8) {
-    results.push(...await Promise.all(items.slice(i, i + 8).map(map)));
-  }
-  return results;
+function mapBatched<T, U>(items: T[], map: (item: T) => Promise<U>): Promise<U[]> {
+  return mapBatches(items, 8, map);
 }
 
 const enc = new TextEncoder();
@@ -239,10 +239,7 @@ function isIndexableMarkdownPath(path: string, policy: VaultPolicy): boolean {
 }
 
 
-async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
-  if (!request.body) return {};
-  return (await request.json().catch(() => ({}))) as Record<string, unknown>;
-}
+const readJsonBody = readBoundedJson;
 
 function isSafeVaultPath(path: string): boolean {
   if (!path || path.startsWith("/") || path.includes("\\")) return false;
@@ -442,91 +439,6 @@ function compareCodePoints(a: string, b: string): number {
   return aPoints.length - bPoints.length;
 }
 
-function getField(doc: DocBody, field: string): unknown {
-  if (field === "_id") return doc._id;
-  if (field === "_rev") return doc._rev;
-  return field.split(".").reduce<unknown>((value, key) => {
-    if (value == null || typeof value !== "object") return undefined;
-    return (value as Record<string, unknown>)[key];
-  }, doc);
-}
-
-function compareValues(a: unknown, b: unknown): number {
-  if (typeof a === "number" && typeof b === "number") return a - b;
-  return compareCodePoints(String(a), String(b));
-}
-
-function matchesCondition(value: unknown, condition: unknown): boolean {
-  if (condition == null || typeof condition !== "object" || Array.isArray(condition)) {
-    return value === condition;
-  }
-  for (const [op, expected] of Object.entries(condition as Record<string, unknown>)) {
-    switch (op) {
-      case "$eq":
-        if (value !== expected) return false;
-        break;
-      case "$ne":
-        if (value === expected) return false;
-        break;
-      case "$lt":
-        if (compareValues(value, expected) >= 0) return false;
-        break;
-      case "$lte":
-        if (compareValues(value, expected) > 0) return false;
-        break;
-      case "$gt":
-        if (compareValues(value, expected) <= 0) return false;
-        break;
-      case "$gte":
-        if (compareValues(value, expected) < 0) return false;
-        break;
-      case "$exists":
-        if ((value !== undefined) !== Boolean(expected)) return false;
-        break;
-      case "$in":
-        if (!Array.isArray(expected) || !expected.includes(value)) return false;
-        break;
-      case "$nin":
-        if (Array.isArray(expected) && expected.includes(value)) return false;
-        break;
-      case "$regex":
-        if (typeof value !== "string" || typeof expected !== "string") return false;
-        try {
-          if (!new RegExp(expected).test(value)) return false;
-        } catch {
-          return false;
-        }
-        break;
-      default:
-        return false;
-    }
-  }
-  return true;
-}
-
-function matchesSelector(doc: DocBody, selector: Selector | null): boolean {
-  if (!selector || Object.keys(selector).length === 0) return true;
-  for (const [field, condition] of Object.entries(selector)) {
-    if (field === "$and") {
-      if (!Array.isArray(condition)) return false;
-      if (!condition.every((item) => matchesSelector(doc, item as Selector))) {
-        return false;
-      }
-      continue;
-    }
-    if (field === "$or") {
-      if (!Array.isArray(condition)) return false;
-      if (!condition.some((item) => matchesSelector(doc, item as Selector))) {
-        return false;
-      }
-      continue;
-    }
-    if (!matchesCondition(getField(doc, field), condition)) return false;
-  }
-  return true;
-}
-
-
 /**
  * Durable Object holding one LiveSync database (vault) in SQLite and keeping
  * its search indexes up to date. Hosts subclass it, export the subclass from
@@ -540,7 +452,10 @@ function matchesSelector(doc: DocBody, selector: Selector | null): boolean {
 export abstract class LiveSyncVaultDO<TEnv = unknown> {
   /** Last successful setAlarm, as a cheap time-based throttle (never a hard gate). */
   private lastIndexScheduleAt = 0;
+  private selectorFallbacks = 0;
+  private selectorScanned = 0;
   private maintenance = Promise.resolve();
+  private exclusive = Promise.resolve();
   private readonly chunkBodies: ChunkBodyStore;
 
   /** Serialize vault operations across R2 awaits, including compaction and migration. */
@@ -548,6 +463,19 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     const previous = this.maintenance;
     let release!: () => void;
     this.maintenance = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  /** Serialize vault operations across R2 awaits, including compaction and migration. */
+  private async withExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.exclusive;
+    let release!: () => void;
+    this.exclusive = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
       return await operation();
@@ -791,8 +719,15 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     // `return await`: a handler's rejected promise must reach this catch,
     // which a bare `return handler()` inside try would skip.
     try {
-      return await this.withMaintenance(() => this.route(request));
+      if (request.body) await readJsonBody(request);
+      const pathname = new URL(request.url).pathname;
+      const body = request.method === "POST" && pathname === "/internal/op" ? await readJsonBody(request) : null;
+      const destructive = (request.method === "DELETE" && pathname === "/") || pathname === "/internal/purge" || body?.op === "reindex" || body?.op === "ftsRebuild";
+      const run = () => this.withExclusive(() => this.route(request));
+      return await (destructive ? this.withMaintenance(run) : run());
     } catch (error) {
+      if (error instanceof BadRequestError) return couchError(400, "bad_request", error.message);
+      if (error instanceof RequestLimitError) return couchError(413, "request_entity_too_large", error.message);
       console.warn("LiveSync DB request failed", error);
       if (this.chunkBodies.needsMaintenance()) await this.scheduleIndexing(1_000);
       return couchError(500, "internal_server_error", "Internal server error");
@@ -800,8 +735,10 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   private async route(request: Request): Promise<Response> {
+    this.bindVaultIdentity(request);
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
+    for (const part of parts) decodePathSegment(part);
     if (request.method === "OPTIONS") return new Response(null, { status: 204 });
     if (this.getMeta("chunk_storage_purging") === "1" &&
         !(request.method === "DELETE" && parts.length === 0) &&
@@ -815,7 +752,9 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       this.dbExists() &&
       (this.indexNeedsVersionUpgrade() ||
         this.indexedSeq() < this.currentSeq() ||
-        this.hasFullTextBacklog() || this.chunkBodies.needsMaintenance())
+        this.hasFullTextBacklog() ||
+        this.first(`SELECT 1 FROM index_state WHERE pending = 1 AND attempts < ? LIMIT 1`, INDEX_MAX_ATTEMPTS) != null ||
+        this.chunkBodies.needsMaintenance())
     ) {
       void this.scheduleIndexing();
     }
@@ -878,11 +817,11 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     if (first === "_compact" && request.method === "POST") return this.handleCompact();
 
     if (first === "_local") {
-      const id = decodeURIComponent(parts.slice(1).join("/"));
+      const id = decodePathSegment(parts.slice(1).join("/"));
       return this.handleLocalDoc(request, id);
     }
 
-    const id = decodeURIComponent(parts.join("/"));
+    const id = decodePathSegment(parts.join("/"));
     return this.handleDoc(request, id);
   }
 
@@ -958,7 +897,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     this.ctx.storage.sql.exec(`DELETE FROM revs`);
     this.ctx.storage.sql.exec(`DELETE FROM local_docs`);
     this.ctx.storage.sql.exec(`DELETE FROM changes`);
-    this.ctx.storage.sql.exec(`DELETE FROM meta`);
+    this.ctx.storage.sql.exec(`DELETE FROM meta WHERE key != 'vault_identity'`);
     this.ctx.storage.sql.exec(`DELETE FROM index_state`);
     return json({ ok: true });
   }
@@ -1037,11 +976,11 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         return this.writeNote(body);
       case "reindex":
         this.setMeta(INDEXED_SEQ_META_KEY, "0");
-        this.requestFullTextRebuild();
+        await this.requestFullTextRebuild();
         await this.scheduleIndexing(0);
         return json({ ok: true });
       case "ftsRebuild":
-        this.requestFullTextRebuild();
+        await this.requestFullTextRebuild();
         await this.scheduleIndexing(0);
         return json({ ok: true });
       case "indexStatus":
@@ -1220,8 +1159,8 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   /** Reassemble a note's content from inline data or child chunks. */
-  private async fileContentForRow(row: RevRow): Promise<string | null> {
-    return (await this.filePieces(cloneBody(this.hydrateRevision(row))))?.join("") ?? null;
+  private async fileContentForRow(row: RevRow, cache?: Map<string, Promise<DocBody>>): Promise<string | null> {
+    return (await this.filePieces(cloneBody(this.hydrateRevision(row)), cache))?.join("") ?? null;
   }
 
   /**
@@ -1238,7 +1177,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   /** The stored pieces of a file in order: inline data or child chunks. */
-  private async filePieces(doc: DocBody): Promise<string[] | null> {
+  private async filePieces(doc: DocBody, cache?: Map<string, Promise<DocBody>>): Promise<string[] | null> {
     if (typeof doc.data === "string") return [doc.data];
     if (Array.isArray(doc.data) && doc.data.every((piece) => typeof piece === "string")) {
       return doc.data as string[];
@@ -1261,7 +1200,10 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       JSON.stringify(children),
     );
     const dataById = new Map(await mapBatched(chunks, async (chunk): Promise<[string, string | null]> => {
-      const body = await this.publicDoc(chunk);
+      const key = `${chunk.id}\0${chunk.rev}`;
+      let read = cache?.get(key);
+      if (!read) { read = this.publicDoc(chunk); cache?.set(key, read); }
+      const body = await read;
       return [chunk.id, typeof body.data === "string" ? body.data : null];
     }));
     const content = children.map((id) => {
@@ -1282,7 +1224,29 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   /** The vault this object holds, recovered from the object name. */
   protected vaultRef(): VaultRef | null {
     const name = this.ctx.id?.name;
-    return name ? parseVaultObjectName(name) : null;
+    if (name) return parseVaultObjectName(name);
+    const persisted = this.getMeta("vault_identity");
+    return persisted ? JSON.parse(persisted) as VaultRef : null;
+  }
+
+  private bindVaultIdentity(request: Request): void {
+    const header = request.headers.get(VAULT_REF_HEADER);
+    if (!header) return;
+    if (!secretEquals(request.headers.get(INTERNAL_SECRET_HEADER), this.host().internalSecret)) {
+      throw new BadRequestError("Untrusted vault identity");
+    }
+    let ref: VaultRef;
+    try { ref = JSON.parse(decodePathSegment(header)); } catch { throw new BadRequestError("Invalid vault identity"); }
+    if (!ref || typeof ref.tenantId !== "string" || typeof ref.databaseName !== "string" || !ref.tenantId || !ref.databaseName) throw new BadRequestError("Invalid vault identity");
+    const known = this.vaultRef();
+    if (known) {
+      if (known.tenantId !== ref.tenantId || known.databaseName !== ref.databaseName) throw new BadRequestError("Vault identity mismatch");
+      return;
+    }
+    const bindings = this.bindings();
+    const expected = bindings.vaultDb.idFromName((bindings.objectName ?? vaultObjectName)(ref));
+    if (!this.ctx.id.equals(expected)) throw new BadRequestError("Vault identity mismatch");
+    this.setMeta("vault_identity", JSON.stringify(ref));
   }
 
   /**
@@ -1302,7 +1266,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     if (typeof storage.setAlarm !== "function" || !this.vaultRef()) return;
     try {
       const existing = typeof storage.getAlarm === "function" ? await storage.getAlarm() : null;
-      const at = Date.now() + delayMs;
+      const at = Math.max(Date.now() + delayMs, Number(this.getMeta("index_retry_at")) || 0);
       // Reschedule when the stored alarm is in the past: a crash-looped alarm
       // the platform has given up on otherwise blocks every future setAlarm.
       if (existing == null || existing > at || existing <= Date.now()) {
@@ -1326,7 +1290,8 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private async runAlarm(): Promise<void> {
     if (this.getMeta("chunk_storage_purging") === "1") return;
     if (this.chunkBodies.needsMaintenance()) {
-      await this.chunkBodies.runMaintenance();
+      try { await this.withExclusive(() => this.chunkBodies.runMaintenance()); }
+      catch (error) { console.warn("LiveSync chunk maintenance failed", error); await this.scheduleIndexing(INDEX_RETRY_DELAY_MS); }
       if (this.chunkBodies.needsMaintenance()) await this.scheduleIndexing(1_000);
     }
     console.log("LiveSync alarm fired", {
@@ -1334,16 +1299,26 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       ftsRebuildAt: this.getMeta(FTS_REBUILD_AT_META_KEY),
     });
     try {
+      const ftsDue = Number(this.getMeta(FTS_REBUILD_AT_META_KEY));
+      if (!this.externalFullText() && ftsDue && ftsDue <= Date.now() && this.getMeta("maintenance_phase") === "index") {
+        this.setMeta("maintenance_phase", "fts");
+        await this.withExclusive(() => this.maybeRunFtsBuild());
+        await this.scheduleIndexing(0);
+        return;
+      }
+      this.setMeta("maintenance_phase", "index");
       const { more, retry, worked } = await this.runIndexing();
       if (more) await this.scheduleIndexing(0);
       else if (retry) await this.scheduleIndexing(INDEX_RETRY_DELAY_MS);
       // The FTS rebuild runs in an alarm event of its own: a crashing rebuild
       // must not roll back the vector-indexing progress made above (SQLite DO
       // events are transactional), so defer it whenever this event did work.
-      if (more || worked) await this.scheduleIndexing(0);
-      else await this.maybeRunFtsBuild();
+      if (more || (worked && !retry)) await this.scheduleIndexing(0);
+      else if (!retry) await this.withExclusive(() => this.maybeRunFtsBuild());
     } catch (error) {
       console.warn("LiveSync indexing failed", error);
+      this.setMeta("index_retry_at", String(Date.now() + INDEX_RETRY_DELAY_MS));
+      if (/subrequest/i.test(String(error))) this.setMeta("index_batch_size", String(Math.max(1, Math.floor((Number(this.getMeta("index_batch_size")) || 16) / 2))));
       await this.scheduleIndexing(INDEX_RETRY_DELAY_MS);
     }
   }
@@ -1352,116 +1327,199 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     return this.getMeta(INDEX_VERSION_META_KEY) !== CURRENT_INDEX_VERSION;
   }
 
-  private async runIndexing(): Promise<{
-    more: boolean;
-    retry: boolean;
-    worked: boolean;
-  }> {
+  private async runIndexing(): Promise<{ more: boolean; retry: boolean; worked: boolean }> {
+    const started = Date.now();
     const ref = this.vaultRef();
     if (!ref || !this.dbExists()) return { more: false, retry: false, worked: false };
-    if (this.indexNeedsVersionUpgrade()) {
-      // Clearing hashes defeats the unchanged-note skip below, so every note is
-      // re-embedded once under the new index version.
-      this.ctx.storage.sql.exec(`UPDATE index_state SET hash = NULL`);
-      this.setMeta(INDEXED_SEQ_META_KEY, "0");
-      this.setMeta(INDEX_VERSION_META_KEY, CURRENT_INDEX_VERSION);
+    const retryAt = Number(this.getMeta("index_retry_at")) || 0;
+    if (retryAt > Date.now()) {
+      await this.scheduleIndexing(retryAt - Date.now());
+      return { more: false, retry: true, worked: false };
     }
-    const policy = await this.loadPolicy(ref);
-
-    const since = this.indexedSeq();
-    const changes = this.rows<ChangeRow>(
-      `SELECT seq, id, rev, deleted FROM changes WHERE seq > ? ORDER BY seq LIMIT ?`,
-      since,
-      INDEX_BATCH_SIZE,
-    );
-    const ids = new Set(changes.map((change) => change.id));
-    const pendingRows = this.rows<IndexStateRow>(`SELECT * FROM index_state WHERE pending = 1`);
     const fullText = this.bindings().fullText;
-    // Vector-indexed notes not yet in the external full-text index.
-    const fullTextBacklog = fullText
-      ? this.rows<IndexStateRow>(
-          `SELECT * FROM index_state
-           WHERE fts_hash IS NULL AND pending = 0 AND hash IS NOT NULL AND doc_id IS NOT NULL
-           ORDER BY path LIMIT ?`,
-          FTS_BACKLOG_BATCH_SIZE,
-        )
-      : [];
-
-    // Paths whose winning doc changed in this batch.
-    const touchedPaths = new Map<string, RevRow | null>();
-    let chunkArrived = false;
-    for (const id of ids) {
-      const row = this.rawWinningRow(id);
-      if (!row) continue;
-      const hydrated = this.hydrateRevision(row);
-      const doc = cloneBody(hydrated);
-      if (isNoteDoc(doc)) {
-        touchedPaths.set(doc.path, row.deleted || docIsDeleted(doc) ? null : hydrated);
-        continue;
-      }
-      if (!row.deleted && !docIsDeleted(doc)) chunkArrived = true;
-      // Tombstones carry no path; recover it from the index state or an earlier revision.
-      const previousPath =
-        this.first<{ path: string }>(`SELECT path FROM index_state WHERE doc_id = ?`, id)?.path ??
-        this.first<{ path: string }>(
-          `SELECT path FROM rev_metadata WHERE id = ? AND path IS NOT NULL ORDER BY rowid DESC LIMIT 1`,
-          id,
-        )?.path;
-      if (previousPath && !touchedPaths.has(previousPath)) {
-        touchedPaths.set(previousPath, this.findNoteRow(previousPath));
-      }
+    const policy = await this.loadPolicy(ref);
+    if (fullText?.indexVersion && this.getMeta("external_fts_version") !== fullText.indexVersion) {
+      await this.withExclusive(async () => {
+        await this.requestFullTextRebuild();
+        this.setMeta("external_fts_version", fullText.indexVersion!);
+        this.setMeta("external_fts_building", "1");
+      });
     }
-    // Chunk arrivals do not carry a path: re-check every pending note when a
-    // chunk arrived, however often it was tried before. Without one, only
-    // notes still under the periodic retry cap are re-checked.
-    for (const pending of pendingRows) {
-      if (touchedPaths.has(pending.path)) continue;
-      if (chunkArrived || pending.attempts < INDEX_MAX_ATTEMPTS) {
-        touchedPaths.set(pending.path, this.findNoteRow(pending.path));
-      }
-    }
-    for (const backlog of fullTextBacklog) {
-      if (touchedPaths.has(backlog.path)) continue;
-      // doc_id is known here, so skip findNoteRow's JSON-scan fallback.
-      const raw = this.rawWinningRow(backlog.doc_id!);
-      const row = raw && !raw.deleted ? this.hydrateRevision(raw) : null;
-      touchedPaths.set(backlog.path, row && !docIsDeleted(cloneBody(row)) ? row : null);
-    }
-
-    // One writer per run, opened on first use. A failed write leaves the note
-    // pending so a later run retries it; the vectors are kept either way.
-    let writer: Promise<FullTextIndexWriter> | undefined;
-    const writeFullText = async (
-      path: string,
-      work: (writer: FullTextIndexWriter) => Promise<void>,
-    ): Promise<boolean> => {
-      try {
-        writer ??= fullText!.openWriter(ref);
-        await work(await writer);
-        return true;
-      } catch (error) {
-        console.warn("Full-text index write failed", { path, error });
-        return false;
-      }
+    const size = Math.max(1, Math.min(16, Number(this.getMeta("index_batch_size")) || 16));
+    type Prepared = {
+      path: string; row: RevRow | null; source: RevRow | null; state: IndexStateRow | null;
+      revisions: Array<[string, string | null]>;
+      content: string | null; hash: string | null; chunks: number;
+      vectorOk: boolean; ftsOk: boolean; failed: boolean;
     };
-
-    let retry = false;
-    try {
-      retry = await this.indexTouchedPaths(touchedPaths, { ref, policy, fullText, writeFullText });
-    } finally {
-      if (writer) await writer.then((opened) => opened.close()).catch(() => undefined);
-    }
-
-    const lastSeq = changes.at(-1)?.seq ?? since;
-    if (lastSeq > since) {
+    let scanned = 0;
+    let preparedBytes = 0;
+    let lastSeq = this.indexedSeq();
+    let moreChanges = false;
+    let cacheReads = 0;
+    let preparationLimit = false;
+    const prepared = await this.withExclusive(async () => {
+      if (this.indexNeedsVersionUpgrade()) {
+        this.ctx.storage.sql.exec(`UPDATE index_state SET hash = NULL`);
+        this.setMeta(INDEXED_SEQ_META_KEY, "0");
+        this.setMeta(INDEX_VERSION_META_KEY, CURRENT_INDEX_VERSION);
+      }
+      const since = this.indexedSeq();
+      const changes = this.rows<ChangeRow>(
+        `SELECT seq, id, rev, deleted FROM changes WHERE seq > ? ORDER BY seq LIMIT ?`, since, INDEX_BATCH_SIZE,
+      );
+      scanned = changes.length;
+      for (const change of changes) {
+        const raw = this.rawWinningRow(change.id);
+        const meta = raw ? this.first<RevisionMetadata>(`SELECT * FROM rev_metadata WHERE id = ? AND rev = ?`, raw.id, raw.rev) : null;
+        const previousPath = this.first<{path: string}>(`SELECT path FROM index_state WHERE doc_id = ?`, change.id)?.path;
+        if (previousPath && previousPath !== meta?.path) this.ctx.storage.sql.exec(`UPDATE index_state SET pending = 1, attempts = 0 WHERE path = ?`, previousPath);
+        const path = meta?.path ?? this.first<{path: string}>(`SELECT path FROM index_state WHERE doc_id = ?`, change.id)?.path;
+        if (path) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts) VALUES (?, ?, NULL, 0, 1, 0)
+             ON CONFLICT(path) DO UPDATE SET pending = 1, attempts = 0`, path, change.id,
+          );
+        } else if (raw && !raw.deleted) {
+          // A persistent sweep revives every exhausted note, across bounded passes.
+          this.setMeta("index_revive_pending", "1");
+        }
+      }
+      if (this.getMeta("index_revive_pending") === "1") {
+        const exhausted = this.rows<{path: string}>(`SELECT path FROM index_state WHERE pending = 1 AND attempts >= ? ORDER BY path LIMIT ?`, INDEX_MAX_ATTEMPTS, size);
+        for (const row of exhausted) this.ctx.storage.sql.exec(`UPDATE index_state SET attempts = 0 WHERE path = ?`, row.path);
+        if (exhausted.length < size) this.setMeta("index_revive_pending", "0");
+      }
+      // Old pending notes and new changes share a rotating cursor: neither starves.
+      const cursor = this.getMeta("index_pending_cursor") ?? "";
+      const candidates = this.rows<IndexStateRow>(
+        `SELECT * FROM index_state WHERE (pending = 1 AND attempts < ?) OR
+          (? = 1 AND fts_hash IS NULL AND hash IS NOT NULL AND pending = 0)
+         ORDER BY CASE WHEN path > ? THEN 0 ELSE 1 END, path LIMIT ?`,
+        INDEX_MAX_ATTEMPTS, fullText ? 1 : 0, cursor, size,
+      );
+      const cache = new Map<string, Promise<DocBody>>();
+      const result: Prepared[] = [];
+      for (const state of candidates) {
+        const row = this.findNoteRow(state.path);
+        const indexable = row && isIndexableMarkdownPath(state.path, policy) ? row : null;
+        const children = indexable ? cloneBody(indexable).children : [];
+        const revisions: Array<[string, string | null]> = indexable ? [[indexable.id, indexable.rev]] : [];
+        if (Array.isArray(children)) for (const id of new Set(children.filter((id): id is string => typeof id === "string"))) {
+          revisions.push([id, this.rawWinningRow(id)?.rev ?? null]);
+        }
+        // Stop before starting another note when its child I/O would exceed
+        // this pass's budget. One large note may run alone to guarantee progress.
+        const uncached = revisions.slice(1).filter(([id, rev]) => !cache.has(`${id}\0${rev}`)).length;
+        if (result.length > 0 && cache.size + uncached > 128) break;
+        let content: string | null = null;
+        let preparationFailed = false;
+        try { content = indexable ? await this.fileContentForRow(indexable, cache) : null; }
+        catch (error) {
+          preparationFailed = true;
+          if (/subrequest/i.test(String(error))) preparationLimit = true;
+        }
+        const hash = content == null ? null : await hashText(content);
+        result.push({path: state.path, row: indexable, source: row, state, revisions, content, hash, chunks: state.chunks, vectorOk: false, ftsOk: false, failed: preparationFailed});
+        this.setMeta("index_pending_cursor", state.path);
+        preparedBytes += content == null ? 0 : enc.encode(content).byteLength;
+        if (preparationLimit || preparedBytes >= 4 * 1024 * 1024) break;
+      }
+      cacheReads = cache.size;
+      lastSeq = changes.at(-1)?.seq ?? since;
+      // All changes are durably represented as pending before moving the cursor.
       this.setMeta(INDEXED_SEQ_META_KEY, String(lastSeq));
-      if (!fullText) this.armFtsBuild(FTS_BUILD_DEBOUNCE_MS);
-    }
-    return {
-      more: changes.length >= INDEX_BATCH_SIZE || fullTextBacklog.length >= FTS_BACKLOG_BATCH_SIZE,
-      retry,
-      worked: changes.length > 0,
+      moreChanges = changes.length >= INDEX_BATCH_SIZE;
+      return result;
+    });
+    const preparedAt = Date.now();
+    let writer: FullTextIndexWriter | undefined;
+    let closeOk = true;
+    let failed = prepared.some(item => item.failed);
+    let subrequestLimit = preparationLimit;
+    const failure = (error: unknown) => {
+      failed = true;
+      if (/subrequest|too many requests/i.test(String(error))) subrequestLimit = true;
+      console.warn("LiveSync index publication failed", { message: error instanceof Error ? error.message : String(error) });
     };
+    try {
+      for (const item of prepared) {
+        try {
+          if (!item.row) {
+            await removeNoteVectors(this.bindings(), { ref, path: item.path, chunks: item.chunks });
+            item.chunks = 0;
+            item.vectorOk = true;
+            if (fullText) {
+              writer ??= await fullText.openWriter(ref);
+              await writer.delete(item.path);
+            }
+            item.ftsOk = true;
+          } else if (item.content != null && item.hash != null) {
+            item.chunks = item.state?.hash === item.hash ? item.chunks : await upsertNoteVectors(this.bindings(), {
+              ref, path: item.path, content: item.content, hash: item.hash, previousChunks: item.chunks,
+              onChunksPlanned: count => { item.chunks = Math.max(item.chunks, count); this.recordPlannedChunks(item.path, item.row!.id, count); },
+            });
+            item.vectorOk = true;
+            if (fullText && item.state?.fts_hash !== item.hash) {
+              writer ??= await fullText.openWriter(ref);
+              if (item.content.length > FTS_MAX_NOTE_CODE_UNITS) await writer.delete(item.path);
+              else await writer.upsert({path: item.path, content: item.content, contentHash: item.hash, mtime: this.noteMtimeForRow(item.row)});
+            }
+            item.ftsOk = true;
+          }
+        } catch (error) {
+          item.failed = true;
+          failure(error);
+          if (subrequestLimit) break;
+        }
+      }
+    } finally {
+      if (writer) {
+        try { await writer.close(); }
+        catch (error) { closeOk = false; failure(error); }
+      }
+    }
+    const publishedAt = Date.now();
+    const result = await this.withExclusive(async () => {
+      for (const item of prepared) {
+        const current = this.findNoteRow(item.path);
+        const unchanged = (current?.id ?? null) === (item.source?.id ?? null) &&
+          (current?.rev ?? null) === (item.source?.rev ?? null) &&
+          item.revisions.every(([id, rev]) => (this.rawWinningRow(id)?.rev ?? null) === rev);
+        if (!unchanged) {
+          this.ctx.storage.sql.exec(`UPDATE index_state SET pending = 1, attempts = 0 WHERE path = ?`, item.path);
+          continue;
+        }
+        const completed = item.vectorOk && item.ftsOk && closeOk && !item.failed;
+        if (completed && !item.row) {
+          this.ctx.storage.sql.exec(`DELETE FROM index_state WHERE path = ?`, item.path);
+          continue;
+        }
+        // Never acknowledge a buffered upsert OR deletion before close succeeds.
+        this.ctx.storage.sql.exec(
+          `UPDATE index_state SET hash = ?, fts_hash = ?, chunks = ?, doc_id = ?, pending = ?, attempts = CASE WHEN ? = 0 THEN 0 ELSE attempts + 1 END WHERE path = ?`,
+          item.vectorOk ? item.hash : item.state?.hash ?? null,
+          fullText && item.ftsOk && closeOk && !item.failed ? item.hash : item.state?.fts_hash ?? null,
+          item.chunks, item.source?.id ?? item.state?.doc_id ?? null, completed ? 0 : 1, !completed && item.row && item.content == null && !item.failed ? 1 : 0, item.path,
+        );
+      }
+      if (!fullText && (prepared.length || scanned)) this.armFtsBuild(FTS_BUILD_DEBOUNCE_MS);
+      const pending = this.first<{n: number}>(`SELECT COUNT(*) AS n FROM index_state WHERE pending = 1 AND attempts < ?`, INDEX_MAX_ATTEMPTS)?.n ?? 0;
+      const backlog = fullText && !!this.first(`SELECT 1 FROM index_state WHERE fts_hash IS NULL AND pending = 0 AND hash IS NOT NULL LIMIT 1`);
+      const retry = failed || prepared.some(item => item.row && item.content == null);
+      this.setMeta("index_retry_at", failed ? String(Date.now() + INDEX_RETRY_DELAY_MS) : "0");
+      this.setMeta("index_batch_size", String(subrequestLimit ? Math.max(1, Math.floor(size / 2)) : failed ? size : Math.min(16, size + 1)));
+      return { more: !retry && (moreChanges || pending > 0 || !!backlog || this.getMeta("index_revive_pending") === "1"), retry, worked: prepared.length > 0 || scanned > 0, pendingCount: pending };
+    });
+    if (fullText && !result.more && !result.retry && this.getMeta("external_fts_building") === "1" &&
+        !this.first(`SELECT 1 FROM index_state WHERE pending = 1 OR fts_hash IS NULL LIMIT 1`)) {
+      await fullText.completeRebuild?.(ref);
+      this.setMeta("external_fts_building", "0");
+    }
+    console.log("LiveSync performance", { phase: "index", scanned, prepared: prepared.length, preparedBytes, chunkReads: cacheReads,
+      prepareMs: preparedAt - started, publishMs: publishedAt - preparedAt, acknowledgeMs: Date.now() - publishedAt,
+      more: result.more, retry: result.retry, pending: result.pendingCount });
+    return result;
   }
 
   /** Track every vector a partially successful upsert might leave behind. */
@@ -1477,128 +1535,6 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     );
   }
 
-  /** Brings vectors (and the external full-text index, if any) up to date for these notes. Returns whether to retry later. */
-  private async indexTouchedPaths(
-    touchedPaths: Map<string, RevRow | null>,
-    options: {
-      ref: VaultRef;
-      policy: VaultPolicy;
-      fullText: FullTextIndex | undefined;
-      writeFullText: (path: string, work: (writer: FullTextIndexWriter) => Promise<void>) => Promise<boolean>;
-    },
-  ): Promise<boolean> {
-    const { ref, policy, fullText, writeFullText } = options;
-    let retry = false;
-    for (const [path, row] of touchedPaths) {
-      const state = this.first<IndexStateRow>(`SELECT * FROM index_state WHERE path = ?`, path);
-      const indexable = row != null && isIndexableMarkdownPath(path, policy);
-      if (!indexable) {
-        if (state) {
-          await removeNoteVectors(this.bindings(), { ref, path, chunks: state.chunks });
-          if (fullText && state.fts_hash != null && !(await writeFullText(path, (w) => w.delete(path)))) {
-            // Keep the row so the deletion is retried; only the vectors are gone.
-            this.ctx.storage.sql.exec(
-              `UPDATE index_state SET chunks = 0, pending = 1, attempts = attempts + 1 WHERE path = ?`,
-              path,
-            );
-            retry = true;
-            continue;
-          }
-          this.ctx.storage.sql.exec(`DELETE FROM index_state WHERE path = ?`, path);
-        }
-        continue;
-      }
-      const content = await this.fileContentForRow(row);
-      if (content == null) {
-        // Chunks not replicated yet; mark pending. Periodic retries stop at
-        // INDEX_MAX_ATTEMPTS, but the note stays pending and is re-checked
-        // whenever a chunk arrives.
-        const attempts =
-          this.first<{ attempts: number }>(
-            `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts)
-             VALUES (?, ?, NULL, 0, 1, 1)
-             ON CONFLICT(path) DO UPDATE SET
-               doc_id = excluded.doc_id, pending = 1, attempts = index_state.attempts + 1
-             RETURNING attempts`,
-            path,
-            row.id,
-          )?.attempts ?? INDEX_MAX_ATTEMPTS;
-        if (attempts < INDEX_MAX_ATTEMPTS) retry = true;
-        continue;
-      }
-      const hash = await hashText(content);
-      if (!fullText) {
-        if (state && !state.pending && state.hash === hash) continue;
-        const chunks = await upsertNoteVectors(this.bindings(), {
-          ref,
-          path,
-          content,
-          hash,
-          previousChunks: state?.chunks ?? 0,
-          onChunksPlanned: (count) => this.recordPlannedChunks(path, row.id, count),
-        });
-        this.ctx.storage.sql.exec(
-          `INSERT INTO index_state (path, doc_id, hash, chunks, pending, attempts)
-           VALUES (?, ?, ?, ?, 0, 0)
-           ON CONFLICT(path) DO UPDATE SET
-             doc_id = excluded.doc_id, hash = excluded.hash, chunks = excluded.chunks,
-             pending = 0, attempts = 0`,
-          path,
-          row.id,
-          hash,
-          chunks,
-        );
-        continue;
-      }
-
-      // Vectors and the full-text index are tracked separately, so a failure
-      // in one does not redo the other.
-      const vectorsCurrent = state?.hash === hash;
-      const fullTextCurrent = state?.fts_hash === hash;
-      if (state && !state.pending && vectorsCurrent && fullTextCurrent) continue;
-      const chunks = vectorsCurrent
-        ? state!.chunks
-        : await upsertNoteVectors(this.bindings(), {
-            ref,
-            path,
-            content,
-            hash,
-            previousChunks: state?.chunks ?? 0,
-            onChunksPlanned: (count) => this.recordPlannedChunks(path, row.id, count),
-          });
-      let ftsHash = state?.fts_hash ?? null;
-      let ftsFailed = false;
-      if (!fullTextCurrent) {
-        const oversized = content.length > FTS_MAX_NOTE_CODE_UNITS;
-        if (oversized) console.warn("Full-text index skipping oversized note", { path });
-        const ok = await writeFullText(path, (w) =>
-          oversized
-            ? w.delete(path)
-            : w.upsert({ path, content, contentHash: hash, mtime: this.noteMtimeForRow(row) }),
-        );
-        if (ok) ftsHash = hash;
-        else ftsFailed = true;
-      }
-      this.ctx.storage.sql.exec(
-        `INSERT INTO index_state (path, doc_id, hash, fts_hash, chunks, pending, attempts)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(path) DO UPDATE SET
-           doc_id = excluded.doc_id, hash = excluded.hash, fts_hash = excluded.fts_hash,
-           chunks = excluded.chunks, pending = excluded.pending,
-           attempts = CASE WHEN excluded.pending = 1 THEN index_state.attempts + 1 ELSE 0 END`,
-        path,
-        row.id,
-        hash,
-        ftsHash,
-        chunks,
-        ftsFailed ? 1 : 0,
-        ftsFailed ? 1 : 0,
-      );
-      if (ftsFailed) retry = true;
-    }
-    return retry;
-  }
-
   /**
    * Whether notes wait for the full-text index with no pass scheduled to
    * take them: external index backlog, or (built-in) pending notes while
@@ -1606,8 +1542,9 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
    * an explicit ftsRebuild, handles it.
    */
   private hasFullTextBacklog(): boolean {
-    if (this.externalFullText()) {
-      return (
+    const external = this.externalFullText();
+    if (external) {
+      return (Boolean(external.indexVersion && external.indexVersion !== this.getMeta("external_fts_version")) || this.getMeta("external_fts_building") === "1" ||
         this.first<{ n: number }>(
           `SELECT 1 AS n FROM index_state
            WHERE fts_hash IS NULL AND pending = 0 AND hash IS NOT NULL LIMIT 1`,
@@ -1623,7 +1560,16 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   /** Re-send every note to the full-text index (external: per note; built-in: new segments). */
-  private requestFullTextRebuild(): void {
+  private async requestFullTextRebuild(): Promise<void> {
+    const fullText = this.externalFullText();
+    const ref = this.vaultRef();
+    if (fullText && ref) {
+      await fullText.beginRebuild?.(ref);
+      this.setMeta("external_fts_building", "1");
+    }
+    this.ctx.storage.sql.exec(`DELETE FROM meta WHERE key = 'fts_debounce_deadline'`);
+    this.setMeta("index_retry_at", "0");
+    this.setMeta("maintenance_phase", "fts");
     // Resetting attempts also revives notes that gave up while the index was unreachable.
     this.ctx.storage.sql.exec(`UPDATE index_state SET fts_hash = NULL, attempts = 0`);
     if (!this.externalFullText()) {
@@ -1690,7 +1636,13 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   private armFtsBuild(delayMs: number): void {
-    this.setMeta(FTS_REBUILD_AT_META_KEY, String(Date.now() + delayMs));
+    let at = Date.now() + delayMs;
+    if (delayMs === FTS_BUILD_DEBOUNCE_MS) {
+      const deadline = Number(this.getMeta("fts_debounce_deadline")) || at;
+      at = Math.min(at, deadline);
+      this.setMeta("fts_debounce_deadline", String(deadline));
+    }
+    this.setMeta(FTS_REBUILD_AT_META_KEY, String(at));
   }
 
   private async maybeRunFtsBuild(): Promise<void> {
@@ -1709,6 +1661,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     }
     try {
       const more = await this.runFtsPass();
+      this.ctx.storage.sql.exec(`DELETE FROM meta WHERE key = 'fts_debounce_deadline'`);
       if (more) {
         this.armFtsBuild(0);
         await this.scheduleIndexing(0);
@@ -1921,11 +1874,12 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     const skipped: Array<{ path: string; hash: string }> = [];
     let consumed = 0;
     let codeUnits = 0;
+    const cache = new Map<string, Promise<DocBody>>();
     async function* inputs(): AsyncGenerator<FtsDocInput> {
       for (const row of pending) {
-        if (consumed >= FTS_SEGMENT_MAX_DOCS || codeUnits >= FTS_SEGMENT_MAX_CODE_UNITS) break;
+        if (consumed >= Math.min(128, FTS_SEGMENT_MAX_DOCS) || codeUnits >= FTS_SEGMENT_MAX_CODE_UNITS || (consumed > 0 && cache.size >= 128)) break;
         const rev = self.rawWinningRow(row.doc_id);
-        const full = rev ? await self.fileContentForRow(rev) : null;
+        const full = rev ? await self.fileContentForRow(rev, cache) : null;
         if (full == null) {
           consumed += 1;
           console.warn("FTS pass skipping note without a readable body", { path: row.path });
@@ -2520,6 +2474,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
 
     if (request.method === "PUT") {
       const body = await readJsonBody(request);
+      assertDocumentSize(body);
       body._id = id;
       const rev = url.searchParams.get("rev");
       if (rev && typeof body._rev !== "string") body._rev = rev;
@@ -2584,6 +2539,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
 
     if (request.method === "PUT") {
       const body = await readJsonBody(request);
+      assertDocumentSize(body);
       const existing = this.first<LocalDocRow>(`SELECT * FROM local_docs WHERE id = ?`, id);
       const expectedRev = typeof body._rev === "string" ? body._rev : url.searchParams.get("rev");
       if (existing && existing.rev !== expectedRev) {
@@ -2625,9 +2581,15 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private async handleBulkDocs(request: Request): Promise<Response> {
     const missing = this.requireDb();
     if (missing) return missing;
+    const started = Date.now();
     const body = await readJsonBody(request);
-    const docs = Array.isArray(body.docs) ? (body.docs as DocBody[]) : [];
+    assertBulkLimits(body);
+    if (!Array.isArray(body.docs) || body.docs.some(doc => !doc || typeof doc !== "object" || Array.isArray(doc))) {
+      throw new BadRequestError("docs must be an array of documents");
+    }
+    const docs = body.docs as DocBody[];
     const newEdits = body.new_edits !== false;
+    const validatedAt = Date.now();
     const results = [];
     for (const doc of docs) {
       const result = await this.insertRevision(doc, { newEdits });
@@ -2637,6 +2599,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
           : { id: result.id, error: result.error, reason: result.reason },
       );
     }
+    console.log("LiveSync performance", { phase: "bulk", documents: docs.length, validateMs: validatedAt - started, persistMs: Date.now() - validatedAt });
     return json(results);
   }
 
@@ -2660,6 +2623,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     if (missing) return missing;
     const url = new URL(request.url);
     const body = await readJsonBody(request);
+    assertBulkLimits(body);
     const includeRevs = boolParam(body.revs) || boolParam(url.searchParams.get("revs"));
     const latest = boolParam(body.latest) || boolParam(url.searchParams.get("latest"));
     const docs = Array.isArray(body.docs)
@@ -2682,10 +2646,15 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private async allDocsOptions(request: Request): Promise<Record<string, unknown>> {
     const url = new URL(request.url);
     const body = request.method === "POST" ? await readJsonBody(request) : {};
-    return {
-      ...Object.fromEntries(url.searchParams.entries()),
-      ...body,
-    };
+    const options: Record<string, unknown> = { ...Object.fromEntries(url.searchParams.entries()), ...body };
+    if (typeof options.keys === "string") {
+      try { options.keys = JSON.parse(options.keys); }
+      catch { throw new BadRequestError("keys must be a JSON array of strings"); }
+    }
+    if (options.keys !== undefined && (!Array.isArray(options.keys) || options.keys.some(key => typeof key !== "string"))) {
+      throw new BadRequestError("keys must be an array of strings");
+    }
+    return options;
   }
 
   private async handleAllDocs(request: Request): Promise<Response> {
@@ -2699,6 +2668,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       `SELECT COUNT(*) AS count FROM docs WHERE deleted = 0`,
     )?.count ?? 0;
     if (keys) {
+      if (keys.length > REQUEST_LIMITS.maxAllDocsKeys) throw new RequestLimitError("maxAllDocsKeys");
       return json({
         total_rows: totalRows,
         offset: 0,
@@ -2736,7 +2706,17 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   private async allDocsRows(ids: string[], includeDoc: boolean, conflicts: boolean): Promise<Record<string, unknown>[]> {
-    return mapBatched(ids, (id) => this.allDocsRow(id, includeDoc, conflicts));
+    const rows: Record<string, unknown>[] = [];
+    let bytes = 0;
+    for (let offset = 0; offset < ids.length; offset += 4) {
+      const page = await mapBatches(ids.slice(offset, offset + 4), 4, id => this.allDocsRow(id, includeDoc, conflicts));
+      for (const row of page) {
+        bytes += enc.encode(JSON.stringify(row)).byteLength;
+        if (bytes > REQUEST_LIMITS.maxResponseBytes) throw new RequestLimitError("maxResponseBytes");
+        rows.push(row);
+      }
+    }
+    return rows;
   }
 
   private async allDocsRow(id: string, includeDoc: boolean, conflicts: boolean): Promise<Record<string, unknown>> {
@@ -2826,11 +2806,22 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     const since = normalizeSince(options.since, this.currentSeq());
     // Longpoll and continuous feeds are driven by the Worker, which re-asks
     // after a change notification; here every feed answers immediately.
+    const started = Date.now();
+    this.selectorFallbacks = 0;
+    this.selectorScanned = 0;
     const batch = await this.changeBatch(options, since);
+    const selectedAt = Date.now();
+    const results = await this.changeResults(batch.rows, options);
+    if (results.length < batch.rows.length) {
+      batch.lastSeq = batch.rows[results.length - 1]!.seq;
+      batch.pending = this.first<{count: number}>(`SELECT COUNT(*) AS count FROM docs WHERE updated_seq > ?`, batch.lastSeq)?.count ?? 0;
+    }
+    console.log("LiveSync performance", { phase: "changes", selected: results.length, pending: batch.pending,
+      scanned: this.selectorScanned, metadataFallbacks: this.selectorFallbacks, selectMs: selectedAt - started, hydrateMs: Date.now() - selectedAt });
     const idle = batch.rows.length === 0 && batch.lastSeq === since;
     return json(
       {
-        results: await this.changeResults(batch.rows, options),
+        results,
         last_seq: batch.lastSeq,
         pending: batch.pending,
       },
@@ -2839,7 +2830,8 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   private async changeBatch(options: Record<string, unknown>, since: number): Promise<ChangeBatch> {
-    const limit = Math.min(Math.max(numberParam(options.limit, 1000), 1), 5000);
+    const cap = boolParam(options.include_docs) || options.selector ? 128 : 5000;
+    const limit = Math.min(Math.max(numberParam(options.limit, 1000), 1), cap);
     const selector = (options.selector ?? null) as Selector | null;
     const style = String(options.style ?? "main_only");
     const scanLimit = selector ? Math.min(limit * 10, 5000) : limit;
@@ -2861,6 +2853,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         scanLimit,
       );
       for (const row of candidates) {
+        this.selectorScanned++;
         lastSeq = row.seq;
         if (style === "all_docs") {
           const leaves = this.rawLeafRevs(row.id);
@@ -2895,17 +2888,26 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   }
 
   private async matchesRevisionSelector(row: RevRow, selector: Selector): Promise<boolean> {
-    // The on-demand LiveSync selector only inspects type. Avoid fetching
-    // every R2 body just to omit chunks from a metadata-only replication.
-    if (Object.keys(selector).every((key) => key === "type")) {
-      const metadata = this.first<{ type: string | null }>(`SELECT type FROM rev_metadata WHERE id = ? AND rev = ?`, row.id, row.rev);
-      if (metadata?.type != null) return matchesSelector({ type: metadata.type }, selector);
-    }
+    const metadata = this.first<RevisionMetadata>(`SELECT * FROM rev_metadata WHERE id = ? AND rev = ?`, row.id, row.rev);
+    const matched = matchesMetadata(row, metadata, selector);
+    if (matched !== undefined) return matched;
+    this.selectorFallbacks++;
     return matchesSelector(await this.publicDoc(row), selector);
   }
 
   private async changeResults(rows: ChangeRow[], options: Record<string, unknown>): Promise<Record<string, unknown>[]> {
-    return mapBatched(rows, (row) => this.changeResult(row, options));
+    const results: Record<string, unknown>[] = [];
+    let bytes = 0;
+    for (let offset = 0; offset < rows.length; offset += 4) {
+      const page = await mapBatches(rows.slice(offset, offset + 4), 4, row => this.changeResult(row, options));
+      for (const result of page) {
+        const size = enc.encode(JSON.stringify(result)).byteLength;
+        if (results.length && bytes + size > REQUEST_LIMITS.maxResponseBytes / 2) return results;
+        results.push(result);
+        bytes += size;
+      }
+    }
+    return results;
   }
 
   private async changeResult(row: ChangeRow, options: Record<string, unknown>): Promise<Record<string, unknown>> {

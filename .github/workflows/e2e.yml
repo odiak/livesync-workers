@@ -1,0 +1,93 @@
+name: LiveSync E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: livesync-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cli:
+    name: Official LiveSync CLI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:e2e:cli
+      - name: Upload CLI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: official-cli-evidence
+          include-hidden-files: true
+          path: |
+            .local/e2e/cli-evidence/result.json
+            .local/e2e/cli-evidence/official-cli-build.json
+            .local/e2e/cli-evidence/official-cli-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  obsidian:
+    name: Real Obsidian and official LiveSync plugin
+    # This supported hosted VM permits the ordinary unprivileged namespace
+    # sandbox. No sysctl/AppArmor/seccomp changes or setuid installation.
+    # Ubuntu 22.04 retires April 2027; reassess the runner before then.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install checksum-pinned official application and plugin
+        run: |
+          npm run test:e2e:install
+          npm run test:e2e:plugin
+      - name: Record standard sandbox runtime prerequisites
+        run: |
+          id
+          command -v Xvfb
+          command -v xauth
+          unshare --user --map-root-user true
+          stat -c '%U:%G %a %n' .local/e2e/obsidian/squashfs-root/chrome-sandbox
+      - name: Run actual Obsidian plugin E2E with authenticated Xvfb
+        env:
+          OBSIDIAN_BINARY: ${{ github.workspace }}/.local/e2e/obsidian/squashfs-root/obsidian
+          OBSIDIAN_CLI: ${{ github.workspace }}/.local/e2e/obsidian/squashfs-root/obsidian-cli
+        run: xvfb-run -a -s '-screen 0 1280x900x24 -nolisten tcp' npm run test:e2e:obsidian
+      - name: Assert actual GUI acceptance
+        run: |
+          node --input-type=module -e "import {readFileSync} from 'node:fs'; import assert from 'node:assert/strict'; const r=JSON.parse(readFileSync('.local/e2e/evidence/result.json')); assert.equal(r.status,'passed'); assert.equal(r.actualObsidian,true); assert.equal(r.cases.length,7);"
+      - name: Upload actual Obsidian evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: actual-obsidian-evidence
+          include-hidden-files: true
+          path: |
+            .local/e2e/evidence/result.json
+            .local/e2e/evidence/failure-*.png
+          if-no-files-found: warn
+          retention-days: 14

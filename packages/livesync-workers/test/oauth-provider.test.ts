@@ -47,7 +47,10 @@ async function authorize(fetch: ReturnType<typeof setup>["fetch"]) {
   }).toString();
   const page = await fetch(new Request(url));
   expect(page.status).toBe(200);
+  expect(page.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+  expect(page.headers.get("X-Frame-Options")).toBe("DENY");
   const html = await page.text();
+  expect(html).toContain(callback);
   const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
   const form = new URLSearchParams({ csrf });
   form.append("grant_scope", "vault:read");

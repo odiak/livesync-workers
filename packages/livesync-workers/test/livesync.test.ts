@@ -162,7 +162,7 @@ describe("LiveSync worker routing", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       chttpd: { require_valid_user: "true" },
-      couchdb: { max_document_size: "50000000" },
+      couchdb: { max_document_size: "4194304" },
       cors: {
         credentials: "true",
         origins:

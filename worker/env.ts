@@ -1,6 +1,7 @@
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 
 export interface Env {
+  AUTH_FAILURE_LIMITER?: { limit(options: { key: string }): Promise<{ success: boolean }> };
   OAUTH_PROVIDER?: OAuthHelpers;
   VAULT_DB: DurableObjectNamespace;
   MCP_OBJECT: DurableObjectNamespace;

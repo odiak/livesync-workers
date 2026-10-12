@@ -1,0 +1,18 @@
+{
+  "repository": "vrtmrz/obsidian-livesync",
+  "version": "1.0.34",
+  "sha256": {
+    "main.js": "45d6567f7ac4e3836e92519db454f415beb5f1c2aa18c4c46951be7113d77f5f",
+    "manifest.json": "7c02b256d9581da2f0edac64bba8104652814b4fcde816a9c91a5f4e2816827b",
+    "styles.css": "4ba00bef417ee98d9a62dd9febb792dc6555949cfc9e8e069450ad699ab2b9f0"
+  },
+  "obsidian": {
+    "version": "1.13.7",
+    "url": "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.13.7/Obsidian-1.13.7.AppImage",
+    "sha256": "e0d8e0a611624de8c9c7dcd8a9e648279fb0a0d552faa1312b7e4f3a5fa72663"
+  },
+  "xvfb": {
+    "url": "https://deb.debian.org/debian/pool/main/x/xorg-server/xvfb_21.1.16-1.3+deb13u3_amd64.deb",
+    "sha256": "365da2b6c93339f34337c434a9489bb6411a240fa47b9f49693d3091745f28c2"
+  }
+}

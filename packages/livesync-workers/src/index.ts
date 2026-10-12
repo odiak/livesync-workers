@@ -32,3 +32,5 @@ export * from "./credentials.js";
 
 export { DEFAULT_CHUNK_BODY_THRESHOLD_BYTES } from "./durable/chunk-body-store.js";
 export type { ChunkStorageStatus, ChunkMigrationProgress } from "./durable/chunk-body-store.js";
+
+export { REQUEST_LIMITS, readBoundedText, BadRequestError, RequestLimitError, AuthThrottledError } from "./livesync/limits.js";

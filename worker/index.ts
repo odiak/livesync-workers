@@ -1,3 +1,5 @@
+import { AUTH_LOCK_SECONDS, isLockedOut, recordAuthFailure } from "./throttle.js";
+import { readBoundedText, RequestLimitError } from "livesync-workers";
 import { LiveSyncVaultDO, handleLiveSyncRequest } from "livesync-workers";
 import { VAULT_SCOPES, VAULT_SCOPE_DESCRIPTIONS, withMcpSessionIsolation } from "livesync-workers/mcp";
 import { createVaultOAuthProvider } from "livesync-workers/oauth";
@@ -47,17 +49,19 @@ const appHandler: ExportedHandler<Env> = {
     const url = new URL(request.url);
 
     if (url.pathname === "/livesync" || url.pathname.startsWith("/livesync/")) {
-      return handleLiveSyncRequest(request, { host: vaultHost(env), bindings: vaultBindings(env) });
+      return handleLiveSyncRequest(request, { host: vaultHost(env, request), bindings: vaultBindings(env) });
     }
 
     if (url.pathname === "/login") {
       const next = safeRedirectTarget(url.searchParams.get("next"), url.origin);
       if (request.method === "GET") return loginPage(next);
       if (request.method === "POST") {
-        const form = await request.formData().catch(() => null);
+        if (await isLockedOut(env, request)) return new Response("Too many sign-in attempts", { status: 429, headers: { "Retry-After": String(AUTH_LOCK_SECONDS) } });
+        const form = new URLSearchParams(await readBoundedText(request, 64 * 1024));
         const password = String(form?.get("password") ?? "");
         const target = safeRedirectTarget(String(form?.get("next") ?? next), url.origin);
         if (!checkAdminPassword(env, password)) {
+          if (await recordAuthFailure(env, request)) return new Response("Too many sign-in attempts", { status: 429, headers: { "Retry-After": String(AUTH_LOCK_SECONDS) } });
           return loginPage(target, "Wrong password.");
         }
         return new Response(null, {
@@ -148,6 +152,9 @@ export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+      if (request.body && url.pathname !== "/livesync" && !url.pathname.startsWith("/livesync/")) {
+        request = new Request(request, { body: await readBoundedText(request) });
+      }
       // Static bearer token bypasses OAuth for clients that cannot do it.
       if (url.pathname === "/mcp" && checkStaticToken(env, request)) {
         // Same principal shape as an OAuth grant, so tools apply the same scope checks.
@@ -163,6 +170,7 @@ export default {
         ctx,
       );
     } catch (error) {
+      if (error instanceof RequestLimitError) return new Response(error.message, { status: 413 });
       if (error instanceof ConfigError) {
         return new Response(`Configuration error: ${error.message}`, { status: 500 });
       }

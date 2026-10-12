@@ -115,7 +115,7 @@ The "not set" ones are optional and deliberately absent from `wrangler.jsonc`, b
 
 Secrets: `LIVESYNC_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, and optionally `MCP_STATIC_TOKEN` (not in `.dev.vars.example`, since every entry there becomes a required field in the Deploy form). Empty values and `change-me…` placeholders count as unset; the status page tells you which ones are missing.
 
-`/livesync` accepts requests from any origin (authentication is HTTP Basic, so there is nothing for a cross-site page to hijack). Daily notes: `appendToDailyNote` takes the date from the client; without one it falls back to today in UTC.
+`/livesync` accepts the Obsidian app origins and this Worker’s origin. Other origins require an explicit host policy. HTTP Basic supports UTF-8 credentials; repeated failed sign-ins are throttled separately for LiveSync and the admin login. Daily notes: `appendToDailyNote` takes the date from the client; without one it falls back to today in UTC.
 
 ## How it works
 
@@ -144,6 +144,10 @@ npm test          # library unit tests
 npm run typecheck
 npm run dev       # wrangler dev (needs a Cloudflare login for AI/Vectorize)
 ```
+
+## Quality checks
+
+See [test/README.md](test/README.md) for unit, workerd, official LiveSync CLI, actual Obsidian and reproducible benchmark commands.
 
 ## License
 

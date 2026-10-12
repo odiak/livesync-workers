@@ -1096,6 +1096,8 @@ describe("LiveSync Vectorize indexing", () => {
       data: "short body", _revisions: { start: 2, ids: ["b", "a"] },
     })]);
     await durableObject.alarm();
+    storage.sql.exec("DELETE FROM meta WHERE key = 'index_retry_at'");
+    await durableObject.alarm();
     expect(vectors.size).toBe(1);
     await replicate(durableObject, [{ _id: "a.md", _rev: "3-d", _deleted: true,
       _revisions: { start: 3, ids: ["d", "b", "a"] } }]);

@@ -27,3 +27,10 @@ describe("MCP connections on the status page", () => {
     expect(html).not.toContain("No MCP connections.");
   });
 });
+
+import { VAULT_TOOL_NAMES } from "livesync-workers/mcp";
+it("keeps the status page and README MCP tool list aligned", async()=>{
+  const html=await statusPage({} as Env,data).text();
+  expect(html).toContain(VAULT_TOOL_NAMES.join(", "));
+
+});

@@ -234,3 +234,27 @@ describe("Vault.grep candidate pages", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
+
+it("append retries only explicit conflicts and re-reads before composing", async () => {
+  const {vault,fetch}=vaultWith([Response.json({content:"base"}),Response.json({error:"CONFLICT"},{status:409}),Response.json({content:"base\n\nconcurrent\n"}),Response.json({ok:true})]);
+  expect(await vault.appendToNote("a.md","mine")).toMatchObject({ok:true});
+  const write=await fetch.mock.calls[3]![0].json() as {content:string;expectedBaseHash:string};
+  expect(write.content).toBe("base\n\nconcurrent\n\nmine\n");
+  expect(write.expectedBaseHash).toBe(await hashText("base\n\nconcurrent\n"));
+});
+it("does not retry ambiguous append failures, and caps genuine conflicts at three", async () => {
+  for(const status of [409,500]) {
+    const responses=Array.from({length:3},()=>[Response.json({content:"base"}),Response.json({error:status===409?"CONFLICT":"WRITE_FAILED"},{status})]).flat();
+    const {vault,fetch}=vaultWith(responses);
+    expect(await vault.appendToNote("a.md","mine")).toMatchObject({ok:false,error:status===409?"CONFLICT":"WRITE_FAILED"});
+    expect(fetch).toHaveBeenCalledTimes(status===409?6:2);
+  }
+});
+it("refills external FTS results after stale, deleted and out-of-folder hits", async () => {
+  const hits=[{path:"Else/first.md",contentHash:await hashText("live")},{path:"Notes/old.md",contentHash:await hashText("old")},{path:"Notes/deleted.md",contentHash:await hashText("gone")},{path:"Notes/live.md",contentHash:await hashText("live")}].map(hit=>({...hit,score:1,matchCount:1,snippets:[]}));
+  const search=vi.fn(async(_ref:unknown,_query:string,limit:number)=>({hits:hits.slice(0,limit),builtAt:1,docCount:4}));
+  const vault=createVault({vaultDb:{idFromName:()=>"a",get:()=>({fetch:async()=>Response.json({contents:{"Else/first.md":"live","Notes/old.md":"new","Notes/deleted.md":null,"Notes/live.md":"live"}})})} as unknown as DurableObjectNamespace,fullText:{search,openWriter:async()=>({upsert:async()=>{},delete:async()=>{},close:async()=>{}}),deleteVault:async()=>{}}},{ref:{tenantId:"a",databaseName:"vault"},policy:{reservedPaths:[],excludedFolders:[],timeZone:"UTC"},internalSecret:TEST_SECRET});
+  const result=await vault.grep("live",1,{folder:"Notes"});
+  expect(result).toMatchObject({status:"ready",hits:[{path:"Notes/live.md"}]});
+  expect(search.mock.calls.map(call=>call[2])).toEqual([1,2,4]);
+});

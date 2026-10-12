@@ -1,3 +1,4 @@
+import { VAULT_REF_HEADER } from "../livesync/http.js";
 import { INTERNAL_SECRET_HEADER } from "../livesync/http.js";
 import { vaultStub } from "../livesync/handler.js";
 import { hashText } from "../search/chunk-md.js";
@@ -8,6 +9,7 @@ import {
   isReservedPath,
   type DailyNoteSettings,
   type FullTextSearchHit,
+  type FullTextIndex,
   type VaultBindings,
   type VaultPolicy,
   type VaultRef,
@@ -54,7 +56,7 @@ export type VaultIndexStatus = {
 };
 
 export type FullTextSearchResult =
-  | { status: "ready"; hits: FullTextSearchHit[]; builtAt: number; docCount: number }
+  | { status: "ready"; hits: FullTextSearchHit[]; builtAt: number; docCount: number; incomplete?: boolean }
   | { status: "building"; debug?: Record<string, unknown> | null }
   /** The query has more index terms than one search may look up; shorten it. */
   | { status: "query-too-long"; maxTokens: number };
@@ -104,7 +106,7 @@ export interface Vault {
    * Exact-match full-text search. With the built-in R2 index, kicks off a
    * rebuild when no index exists yet.
    */
-  grep(query: string, limit: number): Promise<FullTextSearchResult>;
+  grep(query: string, limit: number, options?: { folder?: string }): Promise<FullTextSearchResult>;
   dailyNoteSettings(): Promise<DailyNoteSettings | undefined>;
   indexStatus(): Promise<VaultIndexStatus>;
   /** Re-scan every document (e.g. after excluded folders change). */
@@ -161,6 +163,7 @@ class VaultClient implements Vault {
         headers: {
           "Content-Type": "application/json",
           [INTERNAL_SECRET_HEADER]: this.options.internalSecret,
+          [VAULT_REF_HEADER]: encodeURIComponent(JSON.stringify(this.ref)),
         },
         body: JSON.stringify(body),
       }),
@@ -249,16 +252,17 @@ class VaultClient implements Vault {
     options: { createIfMissing?: boolean } = {},
   ): Promise<AppendVaultNoteResult> {
     if (this.hidden(path)) return { ok: false, error: "FORBIDDEN_PATH", path };
-    const current = await this.readNote(path);
-    if (current == null && !options.createIfMissing) {
-      return { ok: false, error: "NOT_FOUND", path };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const current = await this.readNote(path);
+      if (current == null && !options.createIfMissing) return { ok: false, error: "NOT_FOUND", path };
+      const block = text.trim();
+      const base = current?.replace(/\s+$/, "");
+      const next = base ? `${base}\n\n${block}\n` : `${block}\n`;
+      const result = await this.writeNote(path, next, await hashText(current ?? ""));
+      if (result.ok) return { ok: true, path, created: current == null };
+      if (result.error !== "CONFLICT") return { ok: false, error: result.error, path };
     }
-    const block = text.trim();
-    const base = current?.replace(/\s+$/, "");
-    const next = base ? `${base}\n\n${block}\n` : `${block}\n`;
-    const result = await this.writeNote(path, next, await hashText(current ?? ""));
-    if (!result.ok) return { ok: false, error: result.error, path };
-    return { ok: true, path, created: current == null };
+    return { ok: false, error: "CONFLICT", path };
   }
 
   async search(query: string, topK: number): Promise<VectorSearchHit[]> {
@@ -276,15 +280,39 @@ class VaultClient implements Vault {
     });
   }
 
-  async grep(query: string, limit: number): Promise<FullTextSearchResult> {
+  async grep(query: string, limit: number, options: { folder?: string } = {}): Promise<FullTextSearchResult> {
+    const folder = options.folder?.replace(/^\/+|\/+$/g, "");
+    const acceptPath = (path: string) => !this.hidden(path) && (!folder || path.startsWith(`${folder}/`));
     if (this.bindings.fullText) {
-      const result = await this.bindings.fullText.search(this.ref, query, limit);
-      return {
-        status: "ready",
-        hits: result.hits.filter((hit) => !this.hidden(hit.path)),
-        builtAt: result.builtAt,
-        docCount: result.docCount,
+      const index = this.bindings.fullText;
+      const validated = new Map<string, boolean>();
+      const validate = async (hits: FullTextSearchHit[]) => {
+        const uncached = hits.filter(hit => acceptPath(hit.path) && !validated.has(`${hit.path}\0${hit.contentHash ?? ""}`));
+        for (let i = 0; i < uncached.length; i += 64) {
+          const page = uncached.slice(i, i + 64);
+          const contents = await this.readNotes(page.map(hit => hit.path));
+          for (const hit of page) {
+            const content = contents[hit.path];
+            validated.set(`${hit.path}\0${hit.contentHash ?? ""}`, content != null && (hit.contentHash == null || await hashText(content) === hit.contentHash));
+          }
+        }
+        return hits.map(hit => acceptPath(hit.path) && !!validated.get(`${hit.path}\0${hit.contentHash ?? ""}`));
       };
+      const finish = async (result: Awaited<ReturnType<FullTextIndex["search"]>>) => {
+        const valid = await validate(result.hits);
+        return { status: "ready" as const, hits: result.hits.filter((_, i) => valid[i]).slice(0, limit), builtAt: result.builtAt, docCount: result.docCount };
+      };
+      if (index.searchWithOptions) return finish(await index.searchWithOptions(this.ref, query, limit, { acceptPath, validate }));
+      // Legacy search only exposes a prefix. Grow it finitely; adapters with large
+      // filtered corpora should implement searchWithOptions for complete top-K.
+      let requested = Math.max(1, limit);
+      while (true) {
+        const result = await index.search(this.ref, query, requested);
+        const current = await finish(result);
+        if (current.hits.length >= limit || result.hits.length < requested) return current;
+        if (requested >= 1024) return { ...current, incomplete: true };
+        requested = Math.min(1024, requested * 2);
+      }
     }
     const bucket = this.bindings.bucket;
     if (!bucket) throw new Error("VaultBindings needs either bucket or fullText");
@@ -300,7 +328,7 @@ class VaultClient implements Vault {
       return { status: "building", debug };
     }
     if (result.status === "query-too-long") return { status: "query-too-long", maxTokens: result.maxTokens };
-    const candidates = result.hits.filter((hit) => !this.hidden(hit.path));
+    const candidates = result.hits.filter((hit) => acceptPath(hit.path));
     // The vault keeps the current versions, drops the rest, and returns the
     // bodies for snippets in the same round trip.
     type ResolvedHit = { path: string; hash: string | null; content: string | null };
@@ -372,7 +400,7 @@ class VaultClient implements Vault {
     const res = await this.stub().fetch(
       new Request("https://livesync-db/internal/purge", {
         method: "POST",
-        headers: { [INTERNAL_SECRET_HEADER]: this.options.internalSecret },
+        headers: { [INTERNAL_SECRET_HEADER]: this.options.internalSecret, [VAULT_REF_HEADER]: encodeURIComponent(JSON.stringify(this.ref)) },
       }),
     );
     if (!res.ok) throw new Error(`LiveSync vault purge failed (${res.status})`);

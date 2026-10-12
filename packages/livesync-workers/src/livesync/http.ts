@@ -33,3 +33,5 @@ export function numberParam(value: unknown, fallback: number): number {
   if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
   return fallback;
 }
+
+export const VAULT_REF_HEADER = "X-LiveSync-Vault-Ref";

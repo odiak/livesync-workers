@@ -19,6 +19,7 @@
     //     full-text search keeps working).
     //   MCP_STATIC_TOKEN_SCOPES: extra scopes for MCP_STATIC_TOKEN (vault:append,vault:write).
   },
+  "ratelimits": [{ "name": "AUTH_FAILURE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }],
   "ai": { "binding": "AI" },
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
   "r2_buckets": [{ "binding": "FTS_BUCKET", "bucket_name": "livesync-fts" }],

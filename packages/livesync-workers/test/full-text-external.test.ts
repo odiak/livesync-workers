@@ -70,7 +70,7 @@ async function vaultWith(options: { fullText?: FullTextIndex; policy?: Partial<V
       }
     },
     getAlarm: vi.fn(async () => null),
-    setAlarm: vi.fn(async () => undefined),
+    setAlarm: vi.fn(async (_at: number) => undefined),
   };
   const env: FullTextEnv = testEnv();
   env.policy = { reservedPaths: [".kuro"], excludedFolders: [], timeZone: "UTC", ...options.policy };
@@ -190,8 +190,10 @@ describe("external full-text index (VaultBindings.fullText)", () => {
     expect(storage.setAlarm).toHaveBeenCalled();
 
     index.openWriter.mockImplementation(openWriter);
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31_000);
     await durableObject.alarm();
     expect([...notes.keys()]).toEqual(["a.md"]);
+    vi.restoreAllMocks();
     expect(vi.mocked(env.AI.run)).toHaveBeenCalledTimes(1);
     await expect(indexStatus(durableObject)).resolves.toMatchObject({
       pending: 0,
@@ -214,6 +216,7 @@ describe("external full-text index (VaultBindings.fullText)", () => {
 
     await durableObject.alarm();
     expect([...notes.keys()]).toEqual(["a.md"]);
+    vi.restoreAllMocks();
     expect(vi.mocked(env.AI.run)).toHaveBeenCalledTimes(1);
   });
 
@@ -329,7 +332,7 @@ describe("Vault client with fullText and objectName", () => {
       builtAt: 123,
       docCount: 2,
     });
-    const fetch = vi.fn(async () => Response.json({ paths: ["a.md"] }));
+    const fetch = vi.fn(async () => Response.json({ paths: ["a.md"], contents: { "a.md": "x alpha y" } }));
     const idFromName = vi.fn((name: string) => name);
     const env = testEnv();
     const { bucket: _bucket, ...withoutBucket } = testBindings(env);
@@ -358,4 +361,154 @@ describe("Vault client with fullText and objectName", () => {
     await vault.listMarkdownPaths();
     expect(idFromName).toHaveBeenCalledWith("knowledge");
   });
+});
+
+describe("publication and concurrency regressions", () => {
+  it("retries both buffered upserts and deletes after close fails", async () => {
+    const { index, writer } = memoryFullText();
+    const { durableObject, database } = await vaultWith({ fullText: index });
+    await replicate(durableObject, [noteDoc("a.md", "1-a", [], { data: "alpha" })]);
+    vi.mocked(writer.close).mockRejectedValueOnce(new Error("publish failed"));
+    await durableObject.alarm();
+    expect(database.prepare("SELECT pending, fts_hash FROM index_state").get()).toMatchObject({ pending: 1, fts_hash: null });
+    database.prepare("DELETE FROM meta WHERE key = 'index_retry_at'").run();
+    await durableObject.alarm();
+    expect(writer.upsert).toHaveBeenCalledTimes(2);
+    await replicate(durableObject, [{ _id: "a.md", _rev: "2-b", _deleted: true, _revisions: { start: 2, ids: ["b", "a"] } }]);
+    vi.mocked(writer.close).mockRejectedValueOnce(new Error("delete publication failed"));
+    await durableObject.alarm();
+    expect(database.prepare("SELECT pending FROM index_state").get()).toMatchObject({ pending: 1 });
+    database.prepare("DELETE FROM meta WHERE key = 'index_retry_at'").run();
+    await durableObject.alarm();
+    expect(writer.delete).toHaveBeenCalledTimes(2);
+    expect(database.prepare("SELECT * FROM index_state").all()).toHaveLength(0);
+  });
+
+  it.each(["note", "child", "unrelated"])("allows sync during publication and validates %s revisions", async (change) => {
+    const { index, writer, notes } = memoryFullText();
+    const { durableObject, database } = await vaultWith({ fullText: index });
+    await replicate(durableObject, [leafDoc("h:a", "alpha"), noteDoc("a.md", "1-a", ["h:a"])]);
+    let release!: () => void;
+    let entered!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(writer.close).mockImplementationOnce(async () => { entered(); await gate; });
+    const alarm = durableObject.alarm();
+    await paused;
+    try {
+      const doc = change === "note" ? noteDoc("a.md", "2-b", [], { data: "beta", _revisions: { start: 2, ids: ["b", "a"] } }) :
+        change === "child" ? { _id: "h:a", _rev: "2-b", type: "leaf", data: "beta", _revisions: { start: 2, ids: ["b", "leaf"] } } :
+        noteDoc("other.md", "1-a", [], { data: "unrelated" });
+      // Would deadlock before publication was split from the canonical lock.
+      expect((await replicate(durableObject, [doc])).status).toBe(200);
+      expect((await durableObject.fetch(new Request("https://db/_changes"))).status).toBe(200);
+    } finally { release(); }
+    await alarm;
+    const state = database.prepare("SELECT pending FROM index_state WHERE path = 'a.md'").get();
+    expect(state).toMatchObject({ pending: change === "unrelated" ? 0 : 1 });
+    await durableObject.alarm();
+    expect(notes.get("a.md")?.content).toBe(change === "unrelated" ? "alpha" : "beta");
+  });
+
+  it("drains bounded pending-only batches without another foreground request", async () => {
+    const { index, notes } = memoryFullText();
+    const { durableObject, database } = await vaultWith({ fullText: index });
+    await replicate(durableObject, Array.from({ length: 41 }, (_, i) => noteDoc(`${i}.md`, "1-a", [], { data: `note ${i}` })));
+    await durableObject.alarm();
+    expect(notes.size).toBe(16);
+    expect(database.prepare("SELECT COUNT(*) n FROM index_state WHERE pending = 1").get()).toMatchObject({ n: 25 });
+    await durableObject.alarm();
+    await durableObject.alarm();
+    expect(notes.size).toBe(41);
+    expect(database.prepare("SELECT COUNT(*) n FROM index_state WHERE pending = 1").get()).toMatchObject({ n: 0 });
+  });
+
+  it("revives all exhausted missing-chunk notes across bounded passes", async () => {
+    const { index, notes } = memoryFullText();
+    const { durableObject, database } = await vaultWith({ fullText: index });
+    await replicate(durableObject, Array.from({ length: 35 }, (_, i) => noteDoc(`${i}.md`, "1-a", ["h:shared"])));
+    await durableObject.alarm();
+    database.prepare("UPDATE index_state SET attempts = 20").run();
+    await replicate(durableObject, [leafDoc("h:shared", "arrived")]);
+    for (let i = 0; i < 6; i++) await durableObject.alarm();
+    expect(notes.size).toBe(35);
+  });
+
+  it("persists subrequest backoff and reduces the next batch", async () => {
+    const { index } = memoryFullText();
+    index.openWriter.mockRejectedValue(new Error("Too many subrequests"));
+    const { durableObject, database, storage } = await vaultWith({ fullText: index });
+    await replicate(durableObject, [noteDoc("a.md", "1-a", [], { data: "alpha" })]);
+    await durableObject.alarm();
+    expect(database.prepare("SELECT value FROM meta WHERE key = 'index_batch_size'").get()).toMatchObject({ value: "8" });
+    const attempts = index.openWriter.mock.calls.length;
+    await durableObject.alarm();
+    expect(index.openWriter).toHaveBeenCalledTimes(attempts);
+    const deadline = Number((database.prepare("SELECT value FROM meta WHERE key = 'index_retry_at'").get() as {value:string}).value);
+    expect(storage.setAlarm.mock.calls.at(-1)![0]).toBeGreaterThanOrEqual(deadline);
+  });
+
+  it("changes only the full-text generation when its version changes", async () => {
+    const { index, writer } = memoryFullText();
+    const begin = vi.fn(async () => {}), complete = vi.fn(async () => {});
+    const external: FullTextIndex = { ...index, indexVersion: "1", beginRebuild: begin, completeRebuild: complete };
+    const { durableObject, env } = await vaultWith({ fullText: external });
+    await replicate(durableObject, [noteDoc("a.md", "1-a", [], { data: "alpha" })]);
+    await durableObject.alarm();
+    external.indexVersion = "2";
+    await durableObject.alarm();
+    expect(begin).toHaveBeenCalledTimes(2);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(writer.upsert).toHaveBeenCalledTimes(2);
+    expect(env.AI.run).toHaveBeenCalledTimes(1);
+  });
+});
+
+it("retries a published batch after acknowledgement storage fails and the instance restarts", async () => {
+  const {index,writer}=memoryFullText();const {durableObject,storage,database,env}=await vaultWith({fullText:index});
+  await replicate(durableObject,[noteDoc("a.md","1-a",[],{data:"alpha"})]);
+  const exec=storage.sql.exec.bind(storage.sql);let fail=true;
+  storage.sql.exec=((query:string,...args:unknown[])=>{if(fail&&query.includes("UPDATE index_state SET hash = ?")){fail=false;throw new Error("injected ack failure");}return exec(query,...args);}) as typeof storage.sql.exec;
+  await durableObject.alarm();
+  expect(database.prepare("SELECT pending,fts_hash FROM index_state").get()).toMatchObject({pending:1,fts_hash:null});
+  database.prepare("DELETE FROM meta WHERE key = 'index_retry_at'").run();
+  const restarted=new FullTextVaultDO({storage,id:{name:"user-1:vault"}} as unknown as DurableObjectState,env);
+  await restarted.alarm();
+  expect(writer.upsert).toHaveBeenCalledTimes(2);
+  expect(database.prepare("SELECT pending FROM index_state").get()).toMatchObject({pending:0});
+});
+
+it("tracks a replacement document id even when the content hash is unchanged",async()=>{
+  const {index,notes}=memoryFullText();const {durableObject,database}=await vaultWith({fullText:index});
+  await replicate(durableObject,[noteDoc("old-id","1-a",[],{path:"a.md",data:"same"})]);await durableObject.alarm();
+  await replicate(durableObject,[{_id:"old-id",_rev:"2-b",_deleted:true,_revisions:{start:2,ids:["b","a"]}},noteDoc("new-id","1-a",[],{path:"a.md",data:"same"})]);
+  await durableObject.alarm();
+  expect(database.prepare("SELECT doc_id FROM index_state WHERE path='a.md'").get()).toMatchObject({doc_id:"new-id"});
+  await replicate(durableObject,[{_id:"new-id",_rev:"2-b",_deleted:true,_revisions:{start:2,ids:["b","a"]}}]);await durableObject.alarm();
+  expect(notes.has("a.md")).toBe(false);
+});
+it("bounds changes response bytes without skipping revisions",async()=>{
+  const {durableObject}=await vaultWith();
+  const docs=Array.from({length:5},(_,i)=>({_id:`h:${i}`,_rev:"1-a",type:"leaf",data:"x".repeat(2*1024*1024)}));
+  expect((await replicate(durableObject,docs)).status).toBe(200);
+  const seen:string[]=[];let since=0;
+  for(let i=0;i<5;i++){
+    const response=await durableObject.fetch(new Request(`https://db/_changes?include_docs=true&since=${since}`));
+    const text=await response.text();expect(new TextEncoder().encode(text).byteLength).toBeLessThan(9*1024*1024);
+    const batch=JSON.parse(text);seen.push(...batch.results.map((row:{id:string})=>row.id));since=batch.last_seq;
+    if(!batch.pending)break;
+  }
+  expect(seen).toEqual(docs.map(doc=>doc._id));
+});
+
+it("re-arms pending-only work after a missing alarm without resetting its retry deadline",async()=>{
+  const {index,writer}=memoryFullText();const {durableObject,storage,database}=await vaultWith({fullText:index});
+  await replicate(durableObject,[noteDoc("a.md","1-a",[],{data:"alpha"})]);
+  vi.mocked(writer.close).mockRejectedValueOnce(new Error("unavailable"));await durableObject.alarm();
+  const deadline=Number((database.prepare("SELECT value FROM meta WHERE key='index_retry_at'").get() as {value:string}).value);
+  storage.setAlarm.mockClear();
+  (durableObject as unknown as {lastIndexScheduleAt:number}).lastIndexScheduleAt=0;
+  await durableObject.fetch(new Request('https://db/'));
+  expect(storage.setAlarm.mock.calls.at(-1)?.[0]).toBeGreaterThanOrEqual(deadline);
+  expect((database.prepare("SELECT value FROM meta WHERE key='indexed_seq'").get() as {value:string}).value).toBe('1');
 });

@@ -1,6 +1,8 @@
+import { REQUEST_LIMITS, readBoundedText, parseJsonObject, BadRequestError, RequestLimitError, AuthThrottledError, decodePathSegment } from "./limits.js";
 import {
   CHANGES_IDLE_HEADER,
   DB_NAME_HEADER,
+  VAULT_REF_HEADER,
   INTERNAL_SECRET_HEADER,
   couchError,
   json,
@@ -80,7 +82,7 @@ function withCors(request: Request, host: VaultHost, response: Response): Respon
 function decodeBasicAuth(header: string | null): { user: string; pass: string } | null {
   if (!header?.startsWith("Basic ")) return null;
   try {
-    const decoded = atob(header.slice("Basic ".length));
+    const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(atob(header.slice("Basic ".length)), c => c.charCodeAt(0)));
     const index = decoded.indexOf(":");
     if (index < 0) return null;
     return { user: decoded.slice(0, index), pass: decoded.slice(index + 1) };
@@ -116,8 +118,11 @@ async function checkBasicAuth(request: Request, host: VaultHost): Promise<AuthRe
 function configValue(section: string, key: string): string {
   const values: Record<string, string> = {
     "chttpd/require_valid_user": "true",
-    "chttpd/max_http_request_size": "4294967296",
-    "couchdb/max_document_size": "50000000",
+    "chttpd/max_http_request_size": String(REQUEST_LIMITS.maxRequestBytes),
+    "couchdb/max_document_size": String(REQUEST_LIMITS.maxDocumentBytes),
+    "livesync/max_bulk_docs": String(REQUEST_LIMITS.maxBulkDocuments),
+    "livesync/max_all_docs_keys": String(REQUEST_LIMITS.maxAllDocsKeys),
+    "livesync/max_response_size": String(REQUEST_LIMITS.maxResponseBytes),
     "chttpd_auth/require_valid_user": "true",
     "couchdb/single_node": "true",
   };
@@ -127,10 +132,11 @@ function configValue(section: string, key: string): string {
 function configObject(host: VaultHost, request: Request) {
   return {
     admins: {},
+    livesync: { max_bulk_docs: String(REQUEST_LIMITS.maxBulkDocuments), max_all_docs_keys: String(REQUEST_LIMITS.maxAllDocsKeys), max_response_size: String(REQUEST_LIMITS.maxResponseBytes) },
     chttpd: {
       require_valid_user: "true",
       enable_cors: "true",
-      max_http_request_size: "4294967296",
+      max_http_request_size: String(REQUEST_LIMITS.maxRequestBytes),
     },
     chttpd_auth: {
       require_valid_user: "true",
@@ -148,7 +154,7 @@ function configObject(host: VaultHost, request: Request) {
     },
     couchdb: {
       single_node: "true",
-      max_document_size: "50000000",
+      max_document_size: String(REQUEST_LIMITS.maxDocumentBytes),
     },
   };
 }
@@ -190,11 +196,11 @@ class ChangeWatcher {
   }
 
   /** Subscribe first, then read: a write landing in between is still delivered. */
-  static async open(stub: DurableObjectStub, internalSecret: string): Promise<ChangeWatcher> {
+  static async open(stub: DurableObjectStub, internalSecret: string, refHeader: string | null): Promise<ChangeWatcher> {
     try {
       const response = await stub.fetch(
         new Request("https://livesync-db/internal/watch", {
-          headers: { Upgrade: "websocket", [INTERNAL_SECRET_HEADER]: internalSecret },
+          headers: { Upgrade: "websocket", [INTERNAL_SECRET_HEADER]: internalSecret, ...(refHeader ? { [VAULT_REF_HEADER]: refHeader } : {}) },
         }),
       );
       const socket = response.webSocket;
@@ -251,7 +257,58 @@ function stripIdleHeader(response: Response): Response {
   return new Response(response.body, { status: response.status, headers });
 }
 
-type ChangeFeedBatch = { results?: unknown[]; last_seq?: unknown };
+type ChangeFeedBatch = { results?: unknown[]; last_seq?: unknown; pending?: number };
+
+const ALL_DOCS_BATCH_SIZE = 128;
+async function proxyAllDocs(
+  request: Request,
+  rewritten: URL,
+  headers: Headers,
+  stub: DurableObjectStub,
+): Promise<Response> {
+  const bodyText = request.method === "POST" ? await readBoundedText(request) : null;
+  const body = parseJsonObject(bodyText ?? "");
+  const queryKeys = rewritten.searchParams.get("keys");
+  let keys: unknown = body.keys;
+  if (!("keys" in body) && queryKeys !== null) {
+    try {
+      keys = JSON.parse(queryKeys);
+    } catch {
+      // The Durable Object returns a CouchDB-style bad_request for malformed keys.
+    }
+  }
+
+  const forward = (batch?: string[]): Promise<Response> => {
+    const url = new URL(rewritten);
+    if (batch && request.method === "GET") url.searchParams.set("keys", JSON.stringify(batch));
+    return stub.fetch(
+      new Request(url, {
+        method: request.method,
+        headers,
+        ...(bodyText !== null ? { body: batch ? JSON.stringify({ ...body, keys: batch }) : bodyText } : {}),
+      }),
+    );
+  };
+
+  if (!Array.isArray(keys) || keys.length <= ALL_DOCS_BATCH_SIZE || !keys.every((key) => typeof key === "string")) {
+    return forward();
+  }
+
+  if (keys.length > REQUEST_LIMITS.maxAllDocsKeys) throw new RequestLimitError("maxAllDocsKeys");
+  const rows: unknown[] = [];
+  let totalRows = 0;
+  let bytes = 0;
+  for (let index = 0; index < keys.length; index += ALL_DOCS_BATCH_SIZE) {
+    const response = await forward(keys.slice(index, index + ALL_DOCS_BATCH_SIZE));
+    if (!response.ok) return response;
+    const result = (await response.json()) as { total_rows: number; rows: unknown[] };
+    bytes += new TextEncoder().encode(JSON.stringify(result.rows)).byteLength;
+    if (bytes > REQUEST_LIMITS.maxResponseBytes) throw new RequestLimitError("maxResponseBytes");
+    totalRows = result.total_rows;
+    rows.push(...result.rows);
+  }
+  return json({ total_rows: totalRows, offset: 0, rows });
+}
 
 async function proxyChanges(
   request: Request,
@@ -260,15 +317,8 @@ async function proxyChanges(
   stub: DurableObjectStub,
   internalSecret: string,
 ): Promise<Response> {
-  const bodyText = request.method === "POST" ? await request.text() : null;
-  let body: Record<string, unknown> = {};
-  if (bodyText) {
-    try {
-      body = JSON.parse(bodyText) as Record<string, unknown>;
-    } catch {
-      body = {};
-    }
-  }
+  const bodyText = request.method === "POST" ? await readBoundedText(request) : null;
+  const body = bodyText ? parseJsonObject(bodyText) : {};
   const options: Record<string, unknown> = {
     ...Object.fromEntries(rewritten.searchParams.entries()),
     ...body,
@@ -290,7 +340,7 @@ async function proxyChanges(
 
   if (feed === "longpoll") {
     const timeout = clampWait(numberParam(options.timeout, MAX_WAIT_MS));
-    const watcher = await ChangeWatcher.open(stub, internalSecret);
+    const watcher = await ChangeWatcher.open(stub, internalSecret, headers.get(VAULT_REF_HEADER));
     try {
       const response = await fetchChanges({ feed: "normal" });
       if (!response.ok || response.headers.get(CHANGES_IDLE_HEADER) !== "1") {
@@ -320,7 +370,7 @@ async function proxyChanges(
     const firstBatch = (await first.json()) as ChangeFeedBatch;
     return continuousChangesProxy(
       fetchChanges,
-      await ChangeWatcher.open(stub, internalSecret),
+      await ChangeWatcher.open(stub, internalSecret, headers.get(VAULT_REF_HEADER)),
       options,
       firstBatch,
     );
@@ -338,6 +388,7 @@ function continuousChangesProxy(
   const encoder = new TextEncoder();
   const deadline = Date.now() + clampWait(numberParam(options.timeout, MAX_WAIT_MS));
   const heartbeat = clampWait(numberParam(options.heartbeat, 10_000));
+  let pending = firstBatch.pending ?? 0;
   let cursor = options.since === undefined ? "0" : String(options.since);
 
   const stream = new ReadableStream<Uint8Array>({
@@ -349,10 +400,11 @@ function continuousChangesProxy(
             controller.enqueue(encoder.encode(`${JSON.stringify(row)}\n`));
           }
           if (batch.last_seq !== undefined) cursor = String(batch.last_seq);
+          pending = batch.pending ?? 0;
           batch = null;
           const remaining = deadline - Date.now();
           if (remaining <= 0) break;
-          const changed = await watcher.wait(Math.min(heartbeat, remaining));
+          const changed = pending > 0 || await watcher.wait(Math.min(heartbeat, remaining));
           if (!changed) {
             controller.enqueue(encoder.encode("\n"));
             if (Date.now() >= deadline) break;
@@ -365,7 +417,7 @@ function continuousChangesProxy(
         }
         controller.enqueue(
           encoder.encode(
-            `${JSON.stringify({ last_seq: Number(cursor) || cursor, pending: 0 })}\n`,
+            `${JSON.stringify({ last_seq: Number(cursor) || cursor, pending })}\n`,
           ),
         );
         controller.close();
@@ -405,6 +457,12 @@ export async function handleLiveSyncRequest(
     // An escaping exception becomes the platform's error page without CORS
     // headers, which the plugin reports as a CORS problem. Answer with a
     // CouchDB-style 500 the client can show and retry instead.
+    if (error instanceof BadRequestError || error instanceof RequestLimitError || error instanceof AuthThrottledError) {
+      const status = error instanceof BadRequestError ? 400 : error instanceof RequestLimitError ? 413 : 429;
+      const response = couchError(status, status === 400 ? "bad_request" : status === 413 ? "request_entity_too_large" : "too_many_requests", error.message);
+      if (error instanceof AuthThrottledError) response.headers.set("Retry-After", String(error.retryAfterSeconds));
+      return withCors(request, options.host, response);
+    }
     console.warn("LiveSync request failed", error);
     return withCors(
       request,
@@ -441,6 +499,7 @@ async function routeLiveSyncRequest(
     return withCors(request, host, authResult.response);
   }
   const auth = authResult?.ok ? authResult : null;
+  if (request.body) await readBoundedText(request);
 
   if (relative === "" && request.method === "GET") {
     return withCors(
@@ -492,7 +551,7 @@ async function routeLiveSyncRequest(
   if (!dbName || dbName.startsWith("_")) {
     return withCors(request, host, couchError(404, "not_found", "missing"));
   }
-  const decodedDbName = decodeURIComponent(dbName);
+  const decodedDbName = decodePathSegment(dbName);
   if (auth!.ref.databaseName !== decodedDbName) {
     return withCors(
       request,
@@ -502,10 +561,15 @@ async function routeLiveSyncRequest(
   }
 
   const dbPath = `/${parts.slice(1).join("/")}`;
+  if (decodePathSegment(dbPath).replace(/^\/+/, "").startsWith("internal/")) {
+    return withCors(request, host, couchError(404, "not_found", "missing"));
+  }
   const rewritten = new URL(request.url);
   rewritten.pathname = dbPath;
   const headers = new Headers(request.headers);
   headers.set(DB_NAME_HEADER, decodedDbName);
+  headers.set(INTERNAL_SECRET_HEADER, host.internalSecret);
+  headers.set(VAULT_REF_HEADER, encodeURIComponent(JSON.stringify(auth!.ref)));
   const stub = vaultStub(options.bindings.vaultDb, auth!.ref, options.bindings.objectName);
   if (dbPath === "/_changes" && (request.method === "GET" || request.method === "POST")) {
     return withCors(
@@ -514,11 +578,14 @@ async function routeLiveSyncRequest(
       await proxyChanges(request, rewritten, headers, stub, host.internalSecret),
     );
   }
+  if (dbPath === "/_all_docs" && (request.method === "GET" || request.method === "POST")) {
+    return withCors(request, host, await proxyAllDocs(request, rewritten, headers, stub));
+  }
   const response = await stub.fetch(
     new Request(rewritten.toString(), {
       method: request.method,
       headers,
-      body: request.body,
+      body: request.body ? await readBoundedText(request) : null,
       redirect: request.redirect,
     }),
   );

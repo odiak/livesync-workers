@@ -1,3 +1,5 @@
+import { AUTH_LOCK_SECONDS, isLockedOut, recordAuthFailure } from "./throttle.js";
+import { AuthThrottledError } from "livesync-workers";
 import {
   constantTimeEquals,
   createVault,
@@ -52,16 +54,19 @@ export function vaultPolicy(env: Env): VaultPolicy {
   };
 }
 
-export function vaultHost(env: Env): VaultHost {
+export function vaultHost(env: Env, request?: Request): VaultHost {
   const ref = vaultRef(env);
   return {
     async verifyCredential(username, password) {
+      if (request && await isLockedOut(env, request)) throw new AuthThrottledError(AUTH_LOCK_SECONDS);
       const expectedUser = liveSyncUsername(env);
       const expectedPass = secretValue(env, "LIVESYNC_PASSWORD");
       if (!expectedPass) return null;
       const userOk = constantTimeEquals(username, expectedUser);
       const passOk = constantTimeEquals(password, expectedPass);
-      return userOk && passOk ? ref : null;
+      if (userOk && passOk) return ref;
+      if (request && await recordAuthFailure(env, request)) throw new AuthThrottledError(AUTH_LOCK_SECONDS);
+      return null;
     },
     async loadVaultPolicy() {
       return vaultPolicy(env);

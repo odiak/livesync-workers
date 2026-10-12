@@ -15,7 +15,14 @@
     "setup": "node scripts/setup.mjs",
     "typecheck": "npm run typecheck -w livesync-workers && tsc -p tsconfig.json --noEmit",
     "test": "npm test -w livesync-workers && vitest run",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "test:workers": "vitest run -c vitest.workers.config.ts --maxWorkers=1 --testTimeout=60000",
+    "typecheck:workers": "tsc -p tsconfig.workers.json --noEmit",
+    "test:e2e:cli": "npm run build && node test/e2e/livesync-cli.mjs",
+    "test:e2e:obsidian": "npm run build && node --use-env-proxy test/e2e/obsidian.mjs",
+    "test:e2e:install": "node --use-env-proxy test/e2e/install.mjs",
+    "test:e2e:plugin": "node --use-env-proxy test/e2e/plugin.mjs",
+    "test:performance": "vitest run -c vitest.performance.config.ts --maxWorkers=1 --testTimeout=60000"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.4.0",
@@ -26,10 +33,13 @@
     "zod": "4.4.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20260501.1",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20261011.1",
+    "@vrtmrz/livesync-commonlib": "0.1.35",
+    "@vrtmrz/obsidian-test-session": "0.3.0",
     "typescript": "6.0.3",
-    "wrangler": "4.87.0",
-    "vitest": "4.1.5"
+    "vitest": "4.1.5",
+    "wrangler": "4.136.0"
   },
   "cloudflare": {
     "bindings": {

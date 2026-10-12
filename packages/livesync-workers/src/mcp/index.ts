@@ -7,6 +7,8 @@ import { dateStringIn } from "../types.js";
 
 export { withMcpSessionIsolation } from "./sessions.js";
 
+export const VAULT_TOOL_NAMES = ["listDirectory", "listNotes", "listRecentNotes", "readNote", "searchNotes", "grepNotes", "readDailyNote", "appendToDailyNote", "appendToNote", "writeNote", "vaultStatus"] as const;
+
 export const VAULT_SCOPES = ["vault:read", "vault:append", "vault:write"] as const;
 export type VaultScope = (typeof VAULT_SCOPES)[number];
 
@@ -218,6 +220,7 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
     "grepNotes",
     `Exact-match full-text search over ${label} notes (substring for Japanese/CJK, whole-word for ASCII). Whitespace-separated phrases are ANDed. Keep queries short (a few words, up to about 60 CJK characters in total). Use searchNotes for semantic queries instead.`,
     {
+      folder: z.string().optional().describe("Restrict matches to this vault-relative folder before selecting results."),
       query: z.string().min(1).max(200).describe("Search phrase(s)."),
       limit: z
         .number()
@@ -227,9 +230,9 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
         .optional()
         .describe("Maximum search hits to return. Default is 20."),
     },
-    async ({ query, limit }) => {
+    async ({ query, limit, folder }) => {
       const vault = await readyVault();
-      const result = await vault.grep(query, clampLimit(limit, 20, 50));
+      const result = await vault.grep(query, clampLimit(limit, 20, 50), { folder });
       if (result.status === "building") {
         return textResult({
           status: "building",

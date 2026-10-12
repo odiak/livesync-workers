@@ -60,13 +60,15 @@ export type FullTextNote = {
 };
 
 export type FullTextSearchHit = {
+  /** Hash of the indexed source; enables validation against the current note. */
+  contentHash?: string;
   path: string;
   score: number;
   matchCount: number;
   snippets: Array<{ before: string; match: string; after: string }>;
 };
 
-/** Writes for one indexing pass; `close` is always called at the end of the pass. */
+/** Writes for one indexing pass. close() must publish durably before resolving; failures are retried idempotently. */
 export interface FullTextIndexWriter {
   upsert(note: FullTextNote): Promise<void>;
   delete(path: string): Promise<void>;
@@ -79,6 +81,16 @@ export interface FullTextIndexWriter {
  * in full inside the Durable Object.
  */
 export interface FullTextIndex {
+  /** Change when tokenization/schema changes; vectors are unaffected. */
+  indexVersion?: string;
+  /** Keep the previous generation searchable until completeRebuild succeeds. Both hooks must be idempotent. */
+  beginRebuild?(ref: VaultRef): Promise<void>;
+  completeRebuild?(ref: VaultRef): Promise<void>;
+  /** Apply filtering and source validation before selecting top-K results. */
+  searchWithOptions?(ref: VaultRef, query: string, limit: number, options: {
+    acceptPath: (path: string) => boolean;
+    validate: (hits: FullTextSearchHit[]) => Promise<boolean[]>;
+  }): ReturnType<FullTextIndex["search"]>;
   /** Called lazily once per indexing pass that has something to write. */
   openWriter(ref: VaultRef): Promise<FullTextIndexWriter>;
   search(
