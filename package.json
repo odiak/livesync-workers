@@ -25,21 +25,21 @@
     "test:performance": "vitest run -c vitest.performance.config.ts --maxWorkers=1 --testTimeout=60000"
   },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "0.4.0",
+    "@cloudflare/workers-oauth-provider": "0.10.4",
     "@modelcontextprotocol/sdk": "1.32.1",
-    "agents": "0.12.0",
-    "ai": "6.0.172",
-    "livesync-workers": "0.1.1",
-    "zod": "4.4.1"
+    "agents": "0.28.0",
+    "ai": "7.0.137",
+    "livesync-workers": "0.7.0",
+    "zod": "4.6.6"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/vitest-plugin": "1.4.0",
     "@cloudflare/workers-types": "5.20261011.1",
-    "@vrtmrz/livesync-commonlib": "0.1.35",
+    "@vrtmrz/livesync-commonlib": "0.1.36",
     "@vrtmrz/obsidian-test-session": "0.3.0",
-    "typescript": "6.0.3",
-    "vitest": "4.1.5",
-    "wrangler": "4.136.0"
+    "typescript": "7.0.2",
+    "vitest": "5.0.3",
+    "wrangler": "4.149.0"
   },
   "cloudflare": {
     "bindings": {
@@ -74,7 +74,12 @@
   },
   "overrides": {
     "agents": {
-      "@modelcontextprotocol/sdk": "$@modelcontextprotocol/sdk"
+      "@modelcontextprotocol/sdk": "$@modelcontextprotocol/sdk",
+      "@modelcontextprotocol/client": "2.3.1",
+      "@modelcontextprotocol/server": "2.3.1"
+    },
+    "@ai-sdk/provider-utils": {
+      "undici": "7.29.1"
     }
   }
 }

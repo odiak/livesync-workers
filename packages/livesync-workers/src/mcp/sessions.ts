@@ -39,7 +39,8 @@ export function withMcpSessionIsolation<Env>(
                     return (name: string, props?: unknown) => object.setName(`${name}:${partition}`, props);
                   }
                   const value = Reflect.get(object, method, object);
-                  return typeof value === "function" ? value.bind(object) : value;
+                  // RPC methods treat property reads such as .bind as remote methods.
+                  return typeof value === "function" ? (...args: unknown[]) => Reflect.apply(value, object, args) : value;
                 },
               });
             };

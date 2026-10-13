@@ -7,7 +7,7 @@ type Props = { userId: string; scope: string[] };
 function setup() {
   const objects = new Map<string, {
     name: string; props?: Props; initialized: unknown; destroy: ReturnType<typeof vi.fn>;
-    setName(name: string, props?: Props): Promise<void>;
+    __unsafe_ensureInitialized(props?: Props): Promise<void>;
     getInitializeRequest(): Promise<unknown>;
     setInitializeRequest(value: unknown): Promise<void>;
     fetch(): Promise<{ webSocket: { accept(): void; close(): void; addEventListener(): void } }>;
@@ -23,9 +23,8 @@ function setup() {
       if (!objects.has(name)) {
         objects.set(name, {
           name, initialized: null, destroy: vi.fn(async () => {}),
-          async setName(name, props) {
-            expect(name).toBe(this.name);
-            // Match PartyServer: props initialize a warm object only once.
+          async __unsafe_ensureInitialized(props) {
+            // Match Agent lifecycle: props initialize a warm object only once.
             this.props ??= props;
           },
           async getInitializeRequest() { return this.initialized; },

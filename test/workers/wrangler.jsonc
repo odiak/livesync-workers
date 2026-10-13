@@ -1,7 +1,39 @@
 {
-  "name": "livesync-workers-test", "main": "./entry.ts",
-  "compatibility_date": "2026-04-30", "compatibility_flags": ["nodejs_compat"],
-  "r2_buckets": [{ "binding": "CONTENT", "bucket_name": "test-content" }, { "binding": "SEARCH", "bucket_name": "test-search" }],
-  "durable_objects": { "bindings": [{ "name": "VAULT_DB", "class_name": "PersistentVaultDO" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PersistentVaultDO"] }]
+  "name": "livesync-workers-test",
+  "main": "./entry.ts",
+  "compatibility_date": "2026-04-30",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CONTENT",
+      "bucket_name": "test-content"
+    },
+    {
+      "binding": "SEARCH",
+      "bucket_name": "test-search"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VAULT_DB",
+        "class_name": "PersistentVaultDO"
+      },
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "IntegrationMCP"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "PersistentVaultDO",
+        "IntegrationMCP"
+      ]
+    }
+  ]
 }
