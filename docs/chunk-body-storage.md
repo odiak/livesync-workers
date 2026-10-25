@@ -55,8 +55,9 @@ sequences are untouched. Alarms continue after the UI closes or the object is
 evicted. A caught failure records `failed` and waits for POST to resume.
 
 Migration is not garbage collection. File deletion does not delete shared
-chunks. Existing CouchDB compaction semantics determine when a revision body can
-be discarded; unreferenced tracked objects are then removed in bounded alarm
+chunks; see [Chunk garbage collection](#chunk-garbage-collection) for that.
+Existing CouchDB compaction semantics determine when a revision body can be
+discarded; unreferenced tracked objects are then removed in bounded alarm
 batches. Database/account purge also lists and deletes the vault's entire chunk
 prefix, including orphaned uploads. A partial chunk purge keeps a deletion marker,
 rejects ordinary access and can be completed by retrying the purge.
@@ -71,3 +72,38 @@ Deploy reader support before migrating. After migration or the first external
 write, rolling back to code without R2 readers is unsafe. Backups/recovery must
 cover both SQLite and R2; SQLite point-in-time recovery alone cannot restore an
 R2 object already deleted by compaction. Reverse migration is not implemented.
+
+## Chunk garbage collection
+
+LiveSync stores every file as content-addressed `h:` chunk documents and never
+deletes them: deleting or rewriting a file leaves its chunks behind as live
+documents that compaction cannot touch. In a vault with attachments these
+orphans can outweigh the live files several times over.
+
+`/internal/chunk-gc` (same `X-LiveSync-Internal` header) handles them:
+
+- GET returns a `ChunkGcStatus`: the current orphans (live `leaf` chunks no
+  current revision of any file points at) with their inline and R2 bytes, how
+  many of them an earlier scan recorded, how many are past the grace period
+  (`due`), and the last scan and collection.
+- POST `{ "action": "scan" }` records the current orphans. A chunk's grace
+  period starts when a scan first sees it; one that gains a reference or
+  changes revision is forgotten by the next scan.
+- POST `{ "action": "collect", "graceMs"?, "limit"? }` scans, then deletes the
+  marked orphans older than `graceMs` (default 7 days) as CouchDB tombstones,
+  at most `limit` (default 1000) per call, and compacts. Deleted chunks leave
+  the clients' local databases through replication; compaction drops their
+  bodies and unreferences their R2 objects, which the next alarm deletes.
+  The response carries what was collected, how many due chunks remain for a
+  further call, and the status afterwards.
+
+The grace period is not optional in practice. LiveSync uploads a file's chunks
+before the file document that points at them, so every upload passes through a
+moment where its chunks look orphaned; a scan must have seen a chunk orphaned
+for the whole period before it goes. Chunks held only by logically deleted
+files (LiveSync keeps those restorable) count as referenced. A device that
+stays offline longer than the grace period with unsynced files whose chunks
+happen to match collected ones will re-upload them, as with LiveSync's own
+chunk cleanup; keep the period longer than your longest expected offline gap.
+Nothing runs automatically: the host decides when to scan and collect.
+

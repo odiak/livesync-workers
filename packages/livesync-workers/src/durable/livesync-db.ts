@@ -2,6 +2,7 @@ import { matchesSelector, matchesMetadata } from "./selector.js";
 import { mapBatches } from "../storage/concurrency.js";
 import { REQUEST_LIMITS, readBoundedJson, BadRequestError, RequestLimitError, assertBulkLimits, assertDocumentSize, decodePathSegment } from "../livesync/limits.js";
 import { hashText } from "../search/chunk-md.js";
+import { ChunkGarbageCollector, DEFAULT_CHUNK_GC_GRACE_MS, type OrphanChunk } from "./chunk-gc.js";
 import { removeNoteVectors, upsertNoteVectors } from "../search/vector-index.js";
 import {
   appendFtsSegment,
@@ -457,6 +458,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private maintenance = Promise.resolve();
   private exclusive = Promise.resolve();
   private readonly chunkBodies: ChunkBodyStore;
+  private readonly chunkGc: ChunkGarbageCollector;
 
   /** Serialize vault operations across R2 awaits, including compaction and migration. */
   private async withMaintenance<T>(operation: () => Promise<T>): Promise<T> {
@@ -490,6 +492,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   ) {
     this.init();
     this.chunkBodies = new ChunkBodyStore(this.ctx.storage, () => this.bindings(), () => this.vaultRef());
+    this.chunkGc = new ChunkGarbageCollector(this.ctx.storage);
   }
 
   protected abstract host(): VaultHost;
@@ -771,6 +774,13 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
           await this.ctx.storage.setAlarm(Date.now());
           return json(status, { status: 202 });
         }
+        return couchError(405, "method_not_allowed", "Method not allowed");
+      }
+      if (url.pathname === "/internal/chunk-gc") {
+        const missing = this.requireDb();
+        if (missing) return missing;
+        if (request.method === "GET") return json(this.chunkGc.status(DEFAULT_CHUNK_GC_GRACE_MS));
+        if (request.method === "POST") return this.handleChunkGc((await readJsonBody(request)) as Record<string, unknown>);
         return couchError(405, "method_not_allowed", "Method not allowed");
       }
       if (url.pathname === "/internal/watch" && request.method === "GET") {
@@ -2749,6 +2759,49 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
   private async handleCompact(): Promise<Response> {
     const missing = this.requireDb();
     if (missing) return missing;
+    this.compactStorage();
+    await this.scheduleIndexing(0);
+    return json({ ok: true }, { status: 202 });
+  }
+
+  /**
+   * Chunk garbage collection (see chunk-gc.ts). `scan` records today's orphans;
+   * `collect` deletes the ones that stayed orphaned for `graceMs` (default a
+   * week), at most `limit` per call, then compacts so their bodies and R2
+   * objects go. Both answer with the status afterwards.
+   */
+  private async handleChunkGc(body: Record<string, unknown>): Promise<Response> {
+    const graceMs = typeof body.graceMs === "number" && body.graceMs >= 0 ? body.graceMs : DEFAULT_CHUNK_GC_GRACE_MS;
+    const limit = typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : 1000;
+    const now = Date.now();
+    const orphans = this.chunkGc.scan(now);
+    if (body.action === "scan") return json({ collected: null, remaining: 0, status: this.chunkGc.status(graceMs, orphans, now) });
+    if (body.action !== "collect") return couchError(400, "bad_request", "action must be scan or collect.");
+    const due = this.chunkGc.due(orphans, graceMs, now);
+    const collected: OrphanChunk[] = [];
+    for (const chunk of due.slice(0, limit)) {
+      const result = await this.insertRevision({ _id: chunk.id, _rev: chunk.rev, _deleted: true }, { newEdits: true });
+      if (result.ok) collected.push(chunk);
+    }
+    if (collected.length > 0) {
+      this.chunkGc.recordCollect(collected, now);
+      this.compactStorage();
+      await this.scheduleIndexing(0);
+    }
+    const collectedIds = new Set(collected.map((chunk) => chunk.id));
+    const remaining = orphans.filter((orphan) => !collectedIds.has(orphan.id));
+    return json({
+      collected: collected.reduce(
+        (total, chunk) => ({ count: total.count + 1, sqliteBytes: total.sqliteBytes + chunk.sqliteBytes, r2Bytes: total.r2Bytes + chunk.r2Bytes }),
+        { count: 0, sqliteBytes: 0, r2Bytes: 0 },
+      ),
+      remaining: due.length - collected.length,
+      status: this.chunkGc.status(graceMs, remaining, now),
+    });
+  }
+
+  /** Drops the bodies of replaced revisions and squashes the changes feed (CouchDB `_compact`). */
+  private compactStorage(): void {
     const sql = this.ctx.storage.sql;
     this.ctx.storage.transactionSync(() => {
       this.chunkBodies.compact();
@@ -2783,8 +2836,6 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         `DELETE FROM changes WHERE seq NOT IN (SELECT MAX(seq) FROM changes GROUP BY id)`,
       );
     });
-    await this.scheduleIndexing(0);
-    return json({ ok: true }, { status: 202 });
   }
 
   private async handleChanges(request: Request): Promise<Response> {
