@@ -127,15 +127,15 @@ export class ChunkGarbageCollector {
    */
   scan(now = Date.now()): OrphanChunk[] {
     const orphans = this.orphans();
+    const current = new Map(orphans.map((orphan) => [orphan.id, orphan.rev]));
+    // Row by row: Durable Object SQLite has no temporary tables to join against.
     this.storage.transactionSync(() => {
-      this.sql.exec(`CREATE TEMP TABLE IF NOT EXISTS chunk_gc_current (id TEXT PRIMARY KEY, rev TEXT NOT NULL)`);
-      this.sql.exec(`DELETE FROM chunk_gc_current`);
-      for (const orphan of orphans) this.sql.exec(`INSERT INTO chunk_gc_current (id, rev) VALUES (?, ?)`, orphan.id, orphan.rev);
-      this.sql.exec(`DELETE FROM chunk_gc WHERE NOT EXISTS (
-        SELECT 1 FROM chunk_gc_current c WHERE c.id = chunk_gc.id AND c.rev = chunk_gc.rev)`);
-      this.sql.exec(`INSERT OR IGNORE INTO chunk_gc (id, rev, marked_at)
-        SELECT id, rev, ? FROM chunk_gc_current`, now);
-      this.sql.exec(`DELETE FROM chunk_gc_current`);
+      for (const row of this.rows<{ id: string; rev: string }>(`SELECT id, rev FROM chunk_gc`)) {
+        if (current.get(row.id) !== row.rev) this.sql.exec(`DELETE FROM chunk_gc WHERE id = ?`, row.id);
+      }
+      for (const orphan of orphans) {
+        this.sql.exec(`INSERT OR IGNORE INTO chunk_gc (id, rev, marked_at) VALUES (?, ?, ?)`, orphan.id, orphan.rev, now);
+      }
       this.setMeta(SCAN_AT_KEY, String(now));
     });
     return orphans;

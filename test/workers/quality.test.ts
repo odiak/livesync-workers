@@ -105,3 +105,32 @@ it("keeps a successful R2 upload invisible if the SQL transaction fails, then re
     expect(state.storage.sql.exec("SELECT * FROM chunk_body_refs WHERE id='h:a'").toArray()).toHaveLength(1);
   });
 });
+it("scans and collects orphaned chunks on real Durable Object SQLite", async () => {
+  const stub = await fixture("chunk-gc");
+  const internal = (body?: unknown) => stub.fetch("https://db/internal/chunk-gc", {
+    method: body === undefined ? "GET" : "POST", headers: {"X-LiveSync-Internal": "integration-secret", "Content-Type": "application/json"},
+    ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+  });
+  const data = "日本語😀".repeat(100);
+  expect((await post(stub, [
+    {_id:"h:kept",_rev:"1-a",type:"leaf",data}, {_id:"h:orphan",_rev:"1-a",type:"leaf",data},
+    {_id:"note.md",_rev:"1-n",path:"note.md",type:"plain",children:["h:kept"]},
+  ])).status).toBe(200);
+  const status = await (await internal()).json() as {orphans:{count:number;r2Bytes:number}};
+  expect(status.orphans.count).toBe(1);
+  expect(status.orphans.r2Bytes).toBeGreaterThan(0);
+  const scanned = await internal({action:"scan"});
+  expect(scanned.status).toBe(200);
+  expect(await scanned.json()).toMatchObject({status:{marked:{count:1},due:{count:0}}});
+  expect((await stub.fetch("https://db/h:orphan")).status).toBe(200);
+  const collected = await internal({action:"collect", graceMs:0});
+  expect(collected.status).toBe(200);
+  expect(await collected.json()).toMatchObject({collected:{count:1},remaining:0,status:{orphans:{count:0}}});
+  expect((await stub.fetch("https://db/h:orphan")).status).toBe(404);
+  expect(await (await stub.fetch("https://db/h:kept")).json()).toMatchObject({data});
+  await runDurableObjectAlarm(stub);
+  await runInDurableObject(stub, async (_,state) => {
+    expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM chunk_objects").one().n).toBe(1);
+  });
+});
+
