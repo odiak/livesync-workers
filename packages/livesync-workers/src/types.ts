@@ -161,6 +161,14 @@ export interface VaultBindings {
    */
   ftsMaxTotalCodeUnits?: number;
   /**
+   * Run chunk garbage collection from the object's alarm: every `every` ms
+   * (default 7 days) scan, then collect chunks orphaned for `graceMs` (default
+   * 7 days) and files LiveSync deleted more than `deletedFilesGraceMs` ago
+   * (default 30 days; they stop being restorable). Unset, nothing runs on its
+   * own; `/internal/chunk-gc` still works for hosts that schedule it themselves.
+   */
+  chunkGc?: { every?: number; graceMs?: number; deletedFilesGraceMs?: number };
+  /**
    * Durable Object name for a vault. Default {@link vaultObjectName}
    * (`${tenantId}:${databaseName}`). A host that changes it must also override
    * `LiveSyncVaultDO.vaultRef()`, which otherwise parses the default name.

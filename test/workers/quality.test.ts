@@ -115,6 +115,7 @@ it("scans and collects orphaned chunks on real Durable Object SQLite", async () 
   expect((await post(stub, [
     {_id:"h:kept",_rev:"1-a",type:"leaf",data}, {_id:"h:orphan",_rev:"1-a",type:"leaf",data},
     {_id:"note.md",_rev:"1-n",path:"note.md",type:"plain",children:["h:kept"]},
+    {_id:"h:held",_rev:"1-a",type:"leaf",data}, {_id:"gone.md",_rev:"1-n",path:"gone.md",type:"plain",deleted:true,children:["h:held"]},
   ])).status).toBe(200);
   const status = await (await internal()).json() as {orphans:{count:number;r2Bytes:number}};
   expect(status.orphans.count).toBe(1);
@@ -125,9 +126,13 @@ it("scans and collects orphaned chunks on real Durable Object SQLite", async () 
   expect((await stub.fetch("https://db/h:orphan")).status).toBe(200);
   const collected = await internal({action:"collect", graceMs:0});
   expect(collected.status).toBe(200);
-  expect(await collected.json()).toMatchObject({collected:{count:1},remaining:0,status:{orphans:{count:0}}});
+  expect(await collected.json()).toMatchObject({collected:{count:1,files:0},remaining:0,status:{orphans:{count:0},deletedFiles:{count:1,heldChunks:{count:1}}}});
   expect((await stub.fetch("https://db/h:orphan")).status).toBe(404);
   expect(await (await stub.fetch("https://db/h:kept")).json()).toMatchObject({data});
+  const purged = await internal({action:"collect", graceMs:0, deletedFilesGraceMs:0});
+  expect(await purged.json()).toMatchObject({collected:{count:1,files:1},status:{deletedFiles:{count:0}}});
+  expect((await stub.fetch("https://db/gone.md")).status).toBe(404);
+  expect((await stub.fetch("https://db/h:held")).status).toBe(404);
   await runDurableObjectAlarm(stub);
   await runInDurableObject(stub, async (_,state) => {
     expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM chunk_objects").one().n).toBe(1);

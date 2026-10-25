@@ -44,9 +44,9 @@ function setup() {
     method, headers: { "Content-Type": "application/json", [INTERNAL_SECRET_HEADER]: TEST_SECRET },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   }));
-  type GcResponse = { collected: { count: number; sqliteBytes: number; r2Bytes: number } | null; remaining: number; status: ChunkGcStatus };
+  type GcResponse = { collected: { count: number; sqliteBytes: number; r2Bytes: number; files: number } | null; remaining: number; status: ChunkGcStatus };
   return {
-    database, objects, request,
+    database, objects, request, bindings, alarmAt: () => alarm,
     put: (docs: unknown[]) => request("/_bulk_docs", { docs, new_edits: false }),
     status: async () => (await request("/internal/chunk-gc")).json() as Promise<ChunkGcStatus>,
     gc: async (body: Record<string, unknown>) => (await request("/internal/chunk-gc", body)).json() as Promise<GcResponse>,
@@ -88,7 +88,7 @@ describe("chunk garbage collection", () => {
 
     // Still inside the grace period: nothing goes.
     const early = await t.gc({ action: "collect" });
-    expect(early.collected).toEqual({ count: 0, sqliteBytes: 0, r2Bytes: 0 });
+    expect(early.collected).toEqual({ count: 0, sqliteBytes: 0, r2Bytes: 0, files: 0 });
     expect((await t.request("/h:c")).status).toBe(200);
 
     // A chunk that becomes referenced during the grace period is unmarked.
@@ -101,7 +101,7 @@ describe("chunk garbage collection", () => {
 
     vi.setSystemTime(start + 8 * DAY);
     const collected = await t.gc({ action: "collect" });
-    expect(collected.collected).toEqual({ count: 1, sqliteBytes: bytesOf({ type: "leaf" }), r2Bytes: bytesOf(leaf("h:d", large)) });
+    expect(collected.collected).toEqual({ count: 1, sqliteBytes: bytesOf({ type: "leaf" }), r2Bytes: bytesOf(leaf("h:d", large)), files: 0 });
     expect(collected.remaining).toBe(0);
     expect(collected.status.orphans.count).toBe(1);
     expect(collected.status.lastCollect).toEqual(collected.collected);
@@ -120,6 +120,66 @@ describe("chunk garbage collection", () => {
     vi.setSystemTime(start + 15 * DAY);
     expect((await t.gc({ action: "collect" })).collected?.count).toBe(1);
     expect((await t.request("/h:late")).status).toBe(404);
+
+    // The deleted file is still restorable, and still holds h:e, until its own grace period ends.
+    const held = (await t.status()).deletedFiles;
+    expect(held).toMatchObject({ count: 1, heldChunks: { count: 1 }, marked: { count: 1, oldestMarkedAt: start }, due: { files: 0 } });
+    expect((await t.request("/held.md")).status).toBe(200);
+    vi.setSystemTime(start + 31 * DAY);
+    const purged = await t.gc({ action: "collect" });
+    expect(purged.collected).toEqual({ count: 1, sqliteBytes: bytesOf(leaf("h:e", "eee")), r2Bytes: 0, files: 1 });
+    expect((await t.request("/held.md")).status).toBe(404);
+    expect((await t.request("/h:e")).status).toBe(404);
+    expect((await t.status()).deletedFiles).toMatchObject({ count: 0, heldChunks: { count: 0 } });
+    expect(t.database.prepare("SELECT COUNT(*) AS n FROM deleted_file_gc").get()).toEqual({ n: 0 });
+  });
+
+  it("keeps a chunk while any deleted file holding it is still inside the grace period", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.now();
+    const t = setup(); await t.create();
+    await t.put([leaf("h:shared", "s"), note("old.md", ["h:shared"], { deleted: true })]);
+    await t.gc({ action: "scan" });
+    vi.setSystemTime(start + 20 * DAY);
+    await t.put([note("recent.md", ["h:shared"], { deleted: true })]);
+    await t.gc({ action: "scan" });
+    vi.setSystemTime(start + 31 * DAY);
+    const first = await t.gc({ action: "collect" });
+    expect(first.collected).toMatchObject({ files: 1, count: 0 });
+    expect((await t.request("/old.md")).status).toBe(404);
+    expect((await t.request("/h:shared")).status).toBe(200);
+    vi.setSystemTime(start + 51 * DAY);
+    expect((await t.gc({ action: "collect" })).collected).toMatchObject({ files: 1, count: 1 });
+    expect((await t.request("/h:shared")).status).toBe(404);
+  });
+
+  it("runs from the alarm on the host's interval when the binding turns it on", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.now();
+    const t = setup(); await t.create();
+    t.bindings.chunkGc = { every: DAY };
+    // Indexing and full-text passes share the alarm and re-arm it for sooner;
+    // fire every alarm before `until` (moving the clock to it) so only the GC's own is left.
+    const settle = async (until: number) => {
+      do {
+        vi.setSystemTime(Math.max(Date.now(), t.alarmAt() ?? 0));
+        await t.tick();
+      } while (t.alarmAt() !== null && t.alarmAt()! <= until);
+    };
+    await t.put([leaf("h:x", "x"), leaf("h:y", "y")]);
+    await settle(start + DAY - 1);
+    const first = await t.status();
+    expect(first.marked.count).toBe(2);
+    // The interval counts from the run that recorded them (the put's own indexing alarm ran first).
+    expect(t.alarmAt()).toBe(first.lastScanAt! + DAY);
+    // Not due yet: nothing collected, the alarm stays on the interval.
+    expect((await t.request("/h:y")).status).toBe(200);
+    vi.setSystemTime(start + 8 * DAY);
+    await settle(start + 9 * DAY - 1);
+    expect((await t.request("/h:y")).status).toBe(404);
+    const second = await t.status();
+    expect(second.lastCollect).toMatchObject({ count: 2, files: 0 });
+    expect(t.alarmAt()).toBe(second.lastCollectAt! + DAY);
   });
 
   it("collects in bounded batches and refuses unknown actions", async () => {

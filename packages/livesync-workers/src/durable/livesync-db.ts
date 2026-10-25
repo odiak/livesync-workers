@@ -2,7 +2,18 @@ import { matchesSelector, matchesMetadata } from "./selector.js";
 import { mapBatches } from "../storage/concurrency.js";
 import { REQUEST_LIMITS, readBoundedJson, BadRequestError, RequestLimitError, assertBulkLimits, assertDocumentSize, decodePathSegment } from "../livesync/limits.js";
 import { hashText } from "../search/chunk-md.js";
-import { ChunkGarbageCollector, DEFAULT_CHUNK_GC_GRACE_MS, type OrphanChunk } from "./chunk-gc.js";
+import {
+  ChunkGarbageCollector,
+  DEFAULT_CHUNK_GC_GRACE_MS,
+  DEFAULT_CHUNK_GC_INTERVAL_MS,
+  DEFAULT_DELETED_FILES_GRACE_MS,
+  sumChunks,
+  type ChunkGcCollected,
+  type ChunkGcOptions,
+  type ChunkGcStatus,
+  type DeletedFile,
+  type OrphanChunk,
+} from "./chunk-gc.js";
 import { removeNoteVectors, upsertNoteVectors } from "../search/vector-index.js";
 import {
   appendFtsSegment,
@@ -757,7 +768,8 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         this.indexedSeq() < this.currentSeq() ||
         this.hasFullTextBacklog() ||
         this.first(`SELECT 1 FROM index_state WHERE pending = 1 AND attempts < ? LIMIT 1`, INDEX_MAX_ATTEMPTS) != null ||
-        this.chunkBodies.needsMaintenance())
+        this.chunkBodies.needsMaintenance() ||
+        this.chunkGcOverdue())
     ) {
       void this.scheduleIndexing();
     }
@@ -779,7 +791,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       if (url.pathname === "/internal/chunk-gc") {
         const missing = this.requireDb();
         if (missing) return missing;
-        if (request.method === "GET") return json(this.chunkGc.status(DEFAULT_CHUNK_GC_GRACE_MS));
+        if (request.method === "GET") return json(this.chunkGc.status(this.chunkGcOptions()));
         if (request.method === "POST") return this.handleChunkGc((await readJsonBody(request)) as Record<string, unknown>);
         return couchError(405, "method_not_allowed", "Method not allowed");
       }
@@ -1304,6 +1316,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
       catch (error) { console.warn("LiveSync chunk maintenance failed", error); await this.scheduleIndexing(INDEX_RETRY_DELAY_MS); }
       if (this.chunkBodies.needsMaintenance()) await this.scheduleIndexing(1_000);
     }
+    await this.maybeRunChunkGc();
     console.log("LiveSync alarm fired", {
       indexedSeq: this.indexedSeq(),
       ftsRebuildAt: this.getMeta(FTS_REBUILD_AT_META_KEY),
@@ -2764,40 +2777,106 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     return json({ ok: true }, { status: 202 });
   }
 
+  /** Grace periods from the host's automatic-GC binding, or the library defaults. */
+  private chunkGcOptions(overrides: Record<string, unknown> = {}): Required<ChunkGcOptions> {
+    const auto = this.bindings().chunkGc;
+    const ms = (value: unknown, fallback: number) => (typeof value === "number" && value >= 0 ? value : fallback);
+    return {
+      graceMs: ms(overrides.graceMs, auto?.graceMs ?? DEFAULT_CHUNK_GC_GRACE_MS),
+      deletedFilesGraceMs: ms(overrides.deletedFilesGraceMs, auto?.deletedFilesGraceMs ?? DEFAULT_DELETED_FILES_GRACE_MS),
+      limit: typeof overrides.limit === "number" && overrides.limit > 0 ? Math.floor(overrides.limit) : 1000,
+    };
+  }
+
   /**
-   * Chunk garbage collection (see chunk-gc.ts). `scan` records today's orphans;
-   * `collect` deletes the ones that stayed orphaned for `graceMs` (default a
-   * week), at most `limit` per call, then compacts so their bodies and R2
-   * objects go. Both answer with the status afterwards.
+   * Chunk garbage collection (see chunk-gc.ts). `scan` records today's orphans
+   * and deleted files; `collect` tombstones the deleted files past their grace
+   * period and the chunks that stayed orphaned past theirs, at most `limit` of
+   * each per call, then compacts so bodies and R2 objects go. Both answer with
+   * the status afterwards.
    */
   private async handleChunkGc(body: Record<string, unknown>): Promise<Response> {
-    const graceMs = typeof body.graceMs === "number" && body.graceMs >= 0 ? body.graceMs : DEFAULT_CHUNK_GC_GRACE_MS;
-    const limit = typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : 1000;
-    const now = Date.now();
-    const orphans = this.chunkGc.scan(now);
-    if (body.action === "scan") return json({ collected: null, remaining: 0, status: this.chunkGc.status(graceMs, orphans, now) });
-    if (body.action !== "collect") return couchError(400, "bad_request", "action must be scan or collect.");
-    const due = this.chunkGc.due(orphans, graceMs, now);
-    const collected: OrphanChunk[] = [];
-    for (const chunk of due.slice(0, limit)) {
-      const result = await this.insertRevision({ _id: chunk.id, _rev: chunk.rev, _deleted: true }, { newEdits: true });
-      if (result.ok) collected.push(chunk);
+    const options = this.chunkGcOptions(body);
+    if (body.action === "scan") {
+      const now = Date.now();
+      return json({ collected: null, remaining: 0, status: this.chunkGc.status(options, this.chunkGc.scan(now), now) });
     }
-    if (collected.length > 0) {
-      this.chunkGc.recordCollect(collected, now);
+    if (body.action !== "collect") return couchError(400, "bad_request", "action must be scan or collect.");
+    return json(await this.collectChunks(options));
+  }
+
+  private async collectChunks(options: Required<ChunkGcOptions>): Promise<{
+    collected: ChunkGcCollected;
+    remaining: number;
+    status: ChunkGcStatus;
+  }> {
+    const now = Date.now();
+    let scan = this.chunkGc.scan(now);
+    // Deleted files first: once they are tombstones, the chunks only they held
+    // are plain orphans and go in the same pass (their wait was the file's).
+    const dueDeleted = this.chunkGc.dueDeletedFiles(scan, options.deletedFilesGraceMs, now);
+    const files: DeletedFile[] = [];
+    for (const file of dueDeleted.files.slice(0, options.limit)) {
+      const result = await this.insertRevision({ _id: file.id, _rev: file.rev, _deleted: true }, { newEdits: true });
+      if (result.ok) files.push(file);
+    }
+    if (files.length > 0) scan = this.chunkGc.look();
+    const released = new Set(dueDeleted.chunks.map((chunk) => chunk.id));
+    const dueChunks = [
+      ...this.chunkGc.due(scan, options.graceMs, now),
+      ...scan.orphans.filter((chunk) => released.has(chunk.id)),
+    ].filter((chunk, index, all) => all.findIndex((other) => other.id === chunk.id) === index);
+    const chunks: OrphanChunk[] = [];
+    for (const chunk of dueChunks.slice(0, options.limit)) {
+      const result = await this.insertRevision({ _id: chunk.id, _rev: chunk.rev, _deleted: true }, { newEdits: true });
+      if (result.ok) chunks.push(chunk);
+    }
+    if (files.length > 0 || chunks.length > 0) {
+      this.chunkGc.recordCollect(chunks, files, now);
       this.compactStorage();
       await this.scheduleIndexing(0);
     }
-    const collectedIds = new Set(collected.map((chunk) => chunk.id));
-    const remaining = orphans.filter((orphan) => !collectedIds.has(orphan.id));
-    return json({
-      collected: collected.reduce(
-        (total, chunk) => ({ count: total.count + 1, sqliteBytes: total.sqliteBytes + chunk.sqliteBytes, r2Bytes: total.r2Bytes + chunk.r2Bytes }),
-        { count: 0, sqliteBytes: 0, r2Bytes: 0 },
-      ),
-      remaining: due.length - collected.length,
-      status: this.chunkGc.status(graceMs, remaining, now),
-    });
+    return {
+      collected: { ...sumChunks(chunks), files: files.length },
+      remaining: dueDeleted.files.length - files.length + dueChunks.length - chunks.length,
+      status: this.chunkGc.status(options, this.chunkGc.look(), now),
+    };
+  }
+
+  /** When the automatic collection should next run; null when the host did not turn it on. */
+  private chunkGcDueAt(): number | null {
+    const auto = this.bindings().chunkGc;
+    if (!auto) return null;
+    return (Number(this.getMeta("chunk_gc_auto_at")) || 0) + (auto.every ?? DEFAULT_CHUNK_GC_INTERVAL_MS);
+  }
+
+  private chunkGcOverdue(): boolean {
+    const dueAt = this.chunkGcDueAt();
+    return dueAt !== null && dueAt <= Date.now();
+  }
+
+  /** Alarm step: collect when due, otherwise keep an alarm armed for the next run. */
+  private async maybeRunChunkGc(): Promise<void> {
+    const dueAt = this.chunkGcDueAt();
+    if (dueAt === null || !this.dbExists()) return;
+    const now = Date.now();
+    if (dueAt > now) {
+      await this.scheduleIndexing(dueAt - now);
+      return;
+    }
+    try {
+      const result = await this.withExclusive(() => this.collectChunks(this.chunkGcOptions()));
+      console.log("LiveSync chunk GC", { ...result.collected, remaining: result.remaining });
+      if (result.remaining > 0) {
+        // More than one pass: come back soon and only then start the next interval.
+        await this.scheduleIndexing(1_000);
+        return;
+      }
+    } catch (error) {
+      console.warn("LiveSync chunk GC failed", error);
+    }
+    this.setMeta("chunk_gc_auto_at", String(now));
+    await this.scheduleIndexing(this.bindings().chunkGc?.every ?? DEFAULT_CHUNK_GC_INTERVAL_MS);
   }
 
   /** Drops the bodies of replaced revisions and squashes the changes feed (CouchDB `_compact`). */

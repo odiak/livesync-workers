@@ -80,30 +80,48 @@ deletes them: deleting or rewriting a file leaves its chunks behind as live
 documents that compaction cannot touch. In a vault with attachments these
 orphans can outweigh the live files several times over.
 
-`/internal/chunk-gc` (same `X-LiveSync-Internal` header) handles them:
+Two kinds of leftovers are collected, each after its own grace period:
 
-- GET returns a `ChunkGcStatus`: the current orphans (live `leaf` chunks no
-  current revision of any file points at) with their inline and R2 bytes, how
-  many of them an earlier scan recorded, how many are past the grace period
-  (`due`), and the last scan and collection.
-- POST `{ "action": "scan" }` records the current orphans. A chunk's grace
-  period starts when a scan first sees it; one that gains a reference or
-  changes revision is forgotten by the next scan.
-- POST `{ "action": "collect", "graceMs"?, "limit"? }` scans, then deletes the
-  marked orphans older than `graceMs` (default 7 days) as CouchDB tombstones,
-  at most `limit` (default 1000) per call, and compacts. Deleted chunks leave
-  the clients' local databases through replication; compaction drops their
-  bodies and unreferences their R2 objects, which the next alarm deletes.
-  The response carries what was collected, how many due chunks remain for a
+- **Orphaned chunks**: live `leaf` chunks no current revision of any file
+  points at. Grace period `graceMs`, default 7 days. It is not optional in
+  practice: LiveSync uploads a file's chunks before the file document that
+  points at them, so every upload passes through a moment where its chunks
+  look orphaned. A scan must have seen a chunk orphaned for the whole period
+  before it goes; a chunk that gains a reference in between is forgotten by
+  the next scan.
+- **Deleted files**: files LiveSync deleted logically (the document stays,
+  marked `deleted` in its body, so a client can restore it) together with the
+  chunks only they still hold. Grace period `deletedFilesGraceMs`, default 30
+  days, counted from when a scan first saw the file deleted. Collecting turns
+  the file into a CouchDB tombstone first, then collects its chunks, so nothing
+  points at a chunk that is gone; a chunk held by several deleted files waits
+  for the last of them. After this period the file is no longer restorable
+  through LiveSync (the client's own trash and backups are unaffected).
+
+`/internal/chunk-gc` (same `X-LiveSync-Internal` header) drives it:
+
+- GET returns a `ChunkGcStatus`: the current orphans with their inline and R2
+  bytes, how many an earlier scan recorded, how many are `due`, the same for
+  deleted files and the chunks they hold, and the last scan and collection.
+- POST `{ "action": "scan" }` records the current orphans and deleted files.
+- POST `{ "action": "collect", "graceMs"?, "deletedFilesGraceMs"?, "limit"? }`
+  scans, then tombstones the deleted files past their grace period and the
+  marked orphans past theirs, at most `limit` (default 1000) of each per call,
+  and compacts. Deleted documents leave the clients' local databases through
+  replication; compaction drops their bodies and unreferences their R2
+  objects, which the next alarm deletes. The response carries what was
+  collected (`files` and chunk `count`/bytes), how many due items remain for a
   further call, and the status afterwards.
 
-The grace period is not optional in practice. LiveSync uploads a file's chunks
-before the file document that points at them, so every upload passes through a
-moment where its chunks look orphaned; a scan must have seen a chunk orphaned
-for the whole period before it goes. Chunks held only by logically deleted
-files (LiveSync keeps those restorable) count as referenced. A device that
-stays offline longer than the grace period with unsynced files whose chunks
+Nothing runs on its own unless the host sets `VaultBindings.chunkGc`:
+
+```ts
+chunkGc: { every: 7 * 86_400_000, graceMs: 7 * 86_400_000, deletedFilesGraceMs: 30 * 86_400_000 }
+```
+
+With it, the object's alarm scans and collects once per `every` (default 7
+days) in passes of 1000, re-arming itself between runs; the first run on a
+vault only records, since grace periods start at the first sighting. A device
+that stays offline longer than `graceMs` with unsynced files whose chunks
 happen to match collected ones will re-upload them, as with LiveSync's own
 chunk cleanup; keep the period longer than your longest expected offline gap.
-Nothing runs automatically: the host decides when to scan and collect.
-
