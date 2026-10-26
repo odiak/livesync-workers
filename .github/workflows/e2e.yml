@@ -79,7 +79,7 @@ jobs:
         run: xvfb-run -a -s '-screen 0 1280x900x24 -nolisten tcp' npm run test:e2e:obsidian
       - name: Assert actual GUI acceptance
         run: |
-          node --input-type=module -e "import {readFileSync} from 'node:fs'; import assert from 'node:assert/strict'; const r=JSON.parse(readFileSync('.local/e2e/evidence/result.json')); assert.equal(r.status,'passed'); assert.equal(r.actualObsidian,true); assert.equal(r.cases.length,7);"
+          node --input-type=module -e "import {readFileSync} from 'node:fs'; import assert from 'node:assert/strict'; const r=JSON.parse(readFileSync('.local/e2e/evidence/result.json')); assert.equal(r.status,'passed'); assert.equal(r.actualObsidian,true); assert.equal(r.cases.length,8);"
       - name: Upload actual Obsidian evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
