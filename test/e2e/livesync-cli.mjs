@@ -193,15 +193,37 @@ try {
       changes.results.some((row) => (row.deleted || row.doc?.deleted) && row.doc?.path === 'assets/original.pdf'),
     );
   });
+  await step('chunk collection after deletes spares live files and a re-added file re-uploads its chunks', async () => {
+    // The reader does not sync while the server collects; grace periods are shortened to zero for the test.
+    const scanned = await backend.chunkGc('a', { action: 'scan' });
+    assert.ok(scanned.status.deletedFiles.count >= 2, 'Deleted note and binary must be recorded as deleted files');
+    const collected = await backend.chunkGc('a', { action: 'collect', graceMs: 0, deletedFilesGraceMs: 0 });
+    assert.ok(collected.collected.files >= 2, 'Deleted files must be tombstoned');
+    assert.ok(collected.collected.count > 0, 'Their chunks must be collected');
+    assert.equal(collected.remaining, 0);
+    result.chunkGc = collected.collected;
+    await sync(a);
+    await expectFile(a, 'assets/retained.png', updated);
+    assert.equal((await backend.request('a', '/assets%2Fretained.png')).status, 200);
+    // Re-adding the deleted binary reuses chunk hashes the server just collected; the official core must re-upload them.
+    await fixture(a, 'assets/original.pdf', original);
+    await sync(a);
+    assert.equal((await backend.request('a', '/assets%2Foriginal.pdf')).status, 200);
+    // The client that missed the collection converges.
+    await sync(reader);
+    await expectFile(reader, 'assets/retained.png', updated);
+    await expectFile(reader, 'assets/original.pdf', original);
+    await expectMissing(reader, '日本語.md');
+  });
   await step('SQLite/R2 persistence after compaction and backend restart reaches a fresh official CLI client', async () => {
     await backend.compact('a');
     await backend.restart();
     const fresh = await client('fresh-after-recovery', 'a');
     await sync(fresh);
     await expectFile(fresh, 'assets/retained.png', updated);
+    await expectFile(fresh, 'assets/original.pdf', original);
     await expectFile(fresh, 'reconnect.md', Buffer.from('after process restart'));
     await expectMissing(fresh, '日本語.md');
-    await expectMissing(fresh, 'assets/original.pdf');
     await sync(foreign);
     await expectFile(foreign, '日本語.md', Buffer.from('foreign'));
   });
