@@ -46,6 +46,7 @@ import {
   isHiddenPath,
   isReservedPath,
   parseVaultObjectName,
+  READ_NOTES_BATCH_SIZE,
   vaultObjectName,
   type FullTextIndex,
   type FullTextIndexWriter,
@@ -972,11 +973,12 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
         return json({ content });
       }
       case "readNotes": {
-        // Batch read for FTS snippets: one DO round trip for all hits.
+        // Batch read for FTS snippets. The vault client splits larger reads
+        // into batches of this size; anything beyond it is dropped here.
         const paths = Array.isArray(body.paths)
           ? body.paths
               .filter((p): p is string => typeof p === "string")
-              .slice(0, 50)
+              .slice(0, READ_NOTES_BATCH_SIZE)
           : [];
         const contents: Record<string, string | null> = {};
         for (const path of paths) contents[path] = null;

@@ -3,6 +3,7 @@ import { createVault, type VaultBindings } from "../src/index.js";
 import { memoryBucket, testBindings, testEnv, TEST_SECRET } from "./helpers.js";
 import { appendFtsSegment } from "../src/search/fts-index.js";
 import { hashText } from "../src/search/chunk-md.js";
+import { isReservedPath } from "../src/types.js";
 
 function vaultWith(
   response: Response | Response[],
@@ -138,6 +139,51 @@ describe("Vault reserved paths", () => {
     const { vault } = vaultWith(Response.json({ content: "# Memory" }));
     await expect(vault.readNote(".kuro/MEMORY.md")).resolves.toBe(null);
     await expect(vault.unrestricted().readNote(".kuro/MEMORY.md")).resolves.toBe("# Memory");
+  });
+
+  it("refuses the hidden-file-sync alias of any path", async () => {
+    const { vault, fetch } = vaultWith(Response.json({ content: "# Memory" }));
+    await expect(vault.readNote("i:.kuro/MEMORY.md")).resolves.toBe(null);
+    await expect(vault.readFile("i:.kuro/secret.png")).resolves.toBe(null);
+    await expect(vault.writeNote("i:.kuro/MEMORY.md", "x", "")).resolves.toMatchObject({
+      ok: false,
+      error: "FORBIDDEN_PATH",
+    });
+    await expect(vault.readNotes(["i:.kuro/MEMORY.md", "i:.obsidian/plugins/x/readme.md"])).resolves.toEqual({
+      "i:.kuro/MEMORY.md": null,
+      "i:.obsidian/plugins/x/readme.md": null,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    await expect(vault.unrestricted().readNote("i:.kuro/MEMORY.md")).resolves.toBe("# Memory");
+  });
+});
+
+it("isReservedPath looks through the hidden-file-sync prefix", () => {
+  expect(isReservedPath("i:.kuro/MEMORY.md", [".kuro"])).toBe(true);
+  expect(isReservedPath("i:.kuro", [".kuro"])).toBe(true);
+  expect(isReservedPath("i:.obsidian/app.json", [".kuro"])).toBe(false);
+  expect(isReservedPath("i:.kuro/MEMORY.md", [])).toBe(false);
+});
+
+describe("Vault.readNotes", () => {
+  it("reads in batches the vault object will serve in full", async () => {
+    const paths = Array.from({ length: 120 }, (_, i) => `Notes/${i}.md`);
+    const { vault, fetch } = vaultWith(
+      [paths.slice(0, 50), paths.slice(50, 100), paths.slice(100)].map((batch) =>
+        Response.json({ contents: Object.fromEntries(batch.map((path) => [path, `body of ${path}`])) }),
+      ),
+    );
+    const contents = await vault.readNotes([...paths, ".kuro/MEMORY.md"]);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const sent = await Promise.all(
+      fetch.mock.calls.map(async (call) => ((await call[0].json()) as { paths: string[] }).paths),
+    );
+    expect(sent.map((batch) => batch.length)).toEqual([50, 50, 20]);
+    expect(sent.flat()).toEqual(paths);
+    expect(Object.keys(contents)).toHaveLength(121);
+    expect(contents["Notes/0.md"]).toBe("body of Notes/0.md");
+    expect(contents["Notes/119.md"]).toBe("body of Notes/119.md");
+    expect(contents[".kuro/MEMORY.md"]).toBe(null);
   });
 });
 

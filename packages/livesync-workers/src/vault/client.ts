@@ -6,7 +6,9 @@ import { vectorSearch, type VectorSearchHit } from "../search/vector-index.js";
 import { defaultFtsCache, ftsSearch, readFtsPhase } from "../search/fts-index.js";
 import { extractSnippet } from "../search/fts/search.js";
 import {
+  isInternalFilePath,
   isReservedPath,
+  READ_NOTES_BATCH_SIZE,
   type DailyNoteSettings,
   type FullTextSearchHit,
   type FullTextIndex,
@@ -152,8 +154,14 @@ class VaultClient implements Vault {
     return vaultStub(this.bindings.vaultDb, this.ref, this.bindings.objectName);
   }
 
+  /**
+   * Paths the restricted vault refuses: reserved paths, and the "i:" alias
+   * LiveSync's hidden file sync uses, which would otherwise name any file
+   * (reserved ones included) under a second spelling. The vault object
+   * resolves hidden files from their plain path, so callers lose nothing.
+   */
   private hidden(path: string): boolean {
-    return this.restricted && isReservedPath(path, this.policy.reservedPaths);
+    return this.restricted && (isInternalFilePath(path) || isReservedPath(path, this.policy.reservedPaths));
   }
 
   private async internalResponse(body: Record<string, unknown>): Promise<Response> {
@@ -205,12 +213,16 @@ class VaultClient implements Vault {
     const visible = paths.filter((path) => !this.hidden(path));
     const contents: Record<string, string | null> = {};
     for (const path of paths) contents[path] = null;
-    if (visible.length === 0) return contents;
-    const payload = await this.internal<{ contents: Record<string, string | null> }>({
-      op: "readNotes",
-      paths: visible,
-    });
-    return { ...contents, ...payload.contents };
+    // The vault object answers at most READ_NOTES_BATCH_SIZE paths per call
+    // and silently drops the rest, so larger reads go in several calls.
+    for (let i = 0; i < visible.length; i += READ_NOTES_BATCH_SIZE) {
+      const payload = await this.internal<{ contents: Record<string, string | null> }>({
+        op: "readNotes",
+        paths: visible.slice(i, i + READ_NOTES_BATCH_SIZE),
+      });
+      Object.assign(contents, payload.contents);
+    }
+    return contents;
   }
 
   async listFileStats(): Promise<VaultNoteStat[]> {

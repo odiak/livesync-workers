@@ -210,8 +210,23 @@ export function isHiddenPath(path: string): boolean {
   return path.split("/").some((segment) => segment.startsWith("."));
 }
 
+/**
+ * Prefix LiveSync's hidden file sync puts on the paths it carries
+ * ("i:.obsidian/app.json"). Such a path names the same vault file as the one
+ * without the prefix, so checks on vault paths must look through it.
+ */
+export const INTERNAL_FILE_PREFIX = "i:";
+
+export function isInternalFilePath(path: string): boolean {
+  return path.startsWith(INTERNAL_FILE_PREFIX);
+}
+
+/** Most paths one `readNotes` round trip to the vault object serves. */
+export const READ_NOTES_BATCH_SIZE = 50;
+
 export function isReservedPath(path: string, reservedPaths: string[]): boolean {
-  const normalized = path.replace(/^\/+|\/+$/g, "");
+  const normalized = (isInternalFilePath(path) ? path.slice(INTERNAL_FILE_PREFIX.length) : path)
+    .replace(/^\/+|\/+$/g, "");
   return reservedPaths.some((reserved) => {
     const base = reserved.replace(/^\/+|\/+$/g, "");
     return base !== "" && (normalized === base || normalized.startsWith(`${base}/`));

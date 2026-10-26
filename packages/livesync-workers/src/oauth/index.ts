@@ -94,7 +94,17 @@ export function htmlPage(title: string, body: string, status = 200, lang = "en")
     `<!doctype html><html lang="${escapeHtml(lang)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(
       title,
     )}</title><style>body{font-family:ui-sans-serif,system-ui,sans-serif;max-width:680px;margin:48px auto;padding:0 20px;line-height:1.6;color:#1f2937}button,.button{display:inline-block;border:0;border-radius:999px;background:#111827;color:white;padding:10px 18px;text-decoration:none;font-weight:600;cursor:pointer}code{background:#f3f4f6;border-radius:6px;padding:2px 5px}.card{border:1px solid #e5e7eb;border-radius:20px;padding:24px;box-shadow:0 10px 24px rgba(15,23,42,.06)}.muted{color:#6b7280}.scope{display:block;margin:8px 0}input[type=password],input[type=text]{font:inherit;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;width:100%;box-sizing:border-box}label{display:block;margin:12px 0 4px}table{border-collapse:collapse}td,th{text-align:left;padding:4px 12px 4px 0;vertical-align:top}</style></head><body>${body}</body></html>`,
-    { status, headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "frame-ancestors 'none'", "X-Frame-Options": "DENY" } },
+    {
+      status,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        // The consent page names the signed-in user and the requesting client;
+        // nothing (browser, proxy or service worker) should keep a copy.
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "frame-ancestors 'none'",
+        "X-Frame-Options": "DENY",
+      },
+    },
   );
 }
 
