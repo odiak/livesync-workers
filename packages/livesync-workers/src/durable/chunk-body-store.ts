@@ -2,6 +2,12 @@ import { hashText } from "../search/chunk-md.js";
 import type { VaultBindings, VaultRef } from "../types.js";
 
 export const DEFAULT_CHUNK_BODY_THRESHOLD_BYTES = 64 * 1024;
+/**
+ * How long an R2 body stays after nothing references it. Matches the 30-day
+ * window of Durable Object point-in-time recovery, so a database restored to
+ * any point in that window still finds every body it points at.
+ */
+export const DEFAULT_CHUNK_OBJECT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const BATCH_SIZE = 8;
 const BATCH_BYTES = 8 * 1024 * 1024;
 const MIGRATION_KEY = "chunk_body_migration";
@@ -22,7 +28,11 @@ export type ChunkStorageStatus = {
   sqliteBytes: number;
   r2Bytes: number;
   externalRevisions: number;
+  /** Unreferenced objects, kept for `retentionMs` so point-in-time recovery stays whole. */
   pendingCleanup: number;
+  /** Bytes of those unreferenced objects (part of `r2Bytes`). */
+  pendingCleanupBytes: number;
+  retentionMs: number;
   remaining: { count: number; bytes: number };
   distribution: Array<{ minimumBytes: number; count: number; bytes: number }>;
   migration: ChunkMigrationProgress;
@@ -42,6 +52,9 @@ export class ChunkBodyStore {
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS chunk_objects (
       object_key TEXT PRIMARY KEY, bytes INTEGER NOT NULL
     )`);
+    const columns = new Set(storage.sql.exec(`PRAGMA table_info(chunk_objects)`).toArray().map((column) => column.name));
+    // When maintenance first found the object unreferenced; NULL while something points at it.
+    if (!columns.has("unreferenced_at")) storage.sql.exec(`ALTER TABLE chunk_objects ADD COLUMN unreferenced_at INTEGER`);
     storage.sql.exec(`CREATE TABLE IF NOT EXISTS chunk_body_refs (
       id TEXT NOT NULL, rev TEXT NOT NULL, object_key TEXT NOT NULL,
       PRIMARY KEY (id, rev)
@@ -57,6 +70,12 @@ export class ChunkBodyStore {
     const bucket = this.bindings().chunkBucket;
     if (!bucket) throw new Error("Chunk R2 binding is required to read or delete stored bodies");
     return bucket;
+  }
+
+  private retention(): number {
+    const value = this.bindings().chunkObjectRetentionMs ?? DEFAULT_CHUNK_OBJECT_RETENTION_MS;
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error("Invalid chunk object retention");
+    return value;
   }
 
   private threshold(): number {
@@ -111,8 +130,11 @@ export class ChunkBodyStore {
       sqliteBytes: this.storage.sql.databaseSize,
       r2Bytes: this.storedBytes(),
       externalRevisions: this.rows<{ n: number }>(`SELECT COUNT(*) AS n FROM chunk_body_refs`)[0]!.n,
-      pendingCleanup: this.rows<{ n: number }>(`SELECT COUNT(*) AS n FROM chunk_objects o
-        WHERE NOT EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = o.object_key)`)[0]!.n,
+      ...(() => {
+        const pending = this.rows<{ n: number; bytes: number }>(`SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS bytes FROM chunk_objects o
+          WHERE NOT EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = o.object_key)`)[0]!;
+        return { pendingCleanup: pending.n, pendingCleanupBytes: pending.bytes, retentionMs: this.retention() };
+      })(),
       remaining: this.rows<{ count: number; bytes: number }>(`SELECT COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes
         FROM (${this.candidatesSql()}) WHERE bytes >= ?`, this.threshold())[0]!,
       distribution,
@@ -168,9 +190,17 @@ export class ChunkBodyStore {
     )`);
   }
 
+  /** Objects nothing points at: not yet stamped, or stamped long enough ago to delete. */
+  private unreferencedSql(now: number): string {
+    return `SELECT object_key FROM chunk_objects o
+      WHERE NOT EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = o.object_key)
+        AND (o.unreferenced_at IS NULL OR o.unreferenced_at <= ${now - this.retention()})`;
+  }
+
   needsMaintenance(): boolean {
-    return this.progress().state === "running" || this.rows(`SELECT 1 FROM chunk_objects o
-      WHERE NOT EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = o.object_key) LIMIT 1`).length > 0;
+    return this.progress().state === "running" || this.rows(`${this.unreferencedSql(Date.now())} LIMIT 1`).length > 0
+      || this.rows(`SELECT 1 FROM chunk_objects o WHERE o.unreferenced_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = o.object_key) LIMIT 1`).length > 0;
   }
 
   async runMaintenance(): Promise<void> {
@@ -204,12 +234,20 @@ export class ChunkBodyStore {
         this.saveProgress({ ...this.progress(), state: "failed", updatedAt: Date.now(), error: "R2 migration failed. Stored SQLite bodies were retained for retry." });
       }
     }
-    const unused = this.rows<{ object_key: string }>(`SELECT object_key FROM chunk_objects o
-      WHERE NOT EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = o.object_key) LIMIT ?`, BATCH_SIZE);
-    if (unused.length) {
-      await this.bucket().delete(unused.map((row) => row.object_key));
+    const now = Date.now();
+    this.storage.transactionSync(() => {
+      // Referenced again (a re-upload reused the key): no longer on its way out.
+      this.storage.sql.exec(`UPDATE chunk_objects SET unreferenced_at = NULL WHERE unreferenced_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = chunk_objects.object_key)`);
+      // Newly unreferenced: start the retention clock instead of deleting.
+      this.storage.sql.exec(`UPDATE chunk_objects SET unreferenced_at = ? WHERE unreferenced_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM chunk_body_refs b WHERE b.object_key = chunk_objects.object_key)`, now);
+    });
+    const expired = this.rows<{ object_key: string }>(`${this.unreferencedSql(now)} LIMIT ?`, BATCH_SIZE);
+    if (expired.length) {
+      await this.bucket().delete(expired.map((row) => row.object_key));
       this.storage.transactionSync(() => {
-        for (const row of unused) this.storage.sql.exec(`DELETE FROM chunk_objects WHERE object_key = ?`, row.object_key);
+        for (const row of expired) this.storage.sql.exec(`DELETE FROM chunk_objects WHERE object_key = ?`, row.object_key);
       });
     }
   }

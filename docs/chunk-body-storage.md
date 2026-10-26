@@ -57,21 +57,28 @@ evicted. A caught failure records `failed` and waits for POST to resume.
 Migration is not garbage collection. File deletion does not delete shared
 chunks; see [Chunk garbage collection](#chunk-garbage-collection) for that.
 Existing CouchDB compaction semantics determine when a revision body can be
-discarded; unreferenced tracked objects are then removed in bounded alarm
-batches. Database/account purge also lists and deletes the vault's entire chunk
+discarded. An object nothing references any more is not deleted at once: the
+next maintenance pass stamps it, and it is deleted in bounded alarm batches
+once `chunkObjectRetentionMs` (default 30 days) has passed. That is the window
+of Durable Object point-in-time recovery, so a database restored to any point
+in it still finds every body it points at; a shorter retention breaks that
+guarantee for the difference. Retained objects stay in `chunkStorageBytes()`
+and appear in the status as `pendingCleanup` / `pendingCleanupBytes`. Database/account purge also lists and deletes the vault's entire chunk
 prefix, including orphaned uploads. A partial chunk purge keeps a deletion marker,
 rejects ordinary access and can be completed by retrying the purge.
 
 Hosts enforcing quotas should add `chunkStorageBytes()` to SQLite storage usage.
-This counts tracked R2 objects until their deletion succeeds. Migration can
+This counts tracked R2 objects until their deletion succeeds, including the ones
+waiting out the retention period. Migration can
 transiently hold both copies. SQLite file allocation may not immediately shrink
 when rows are removed, so migrated bytes are not a promise of an equal immediate
 reduction in billed SQLite size.
 
 Deploy reader support before migrating. After migration or the first external
-write, rolling back to code without R2 readers is unsafe. Backups/recovery must
-cover both SQLite and R2; SQLite point-in-time recovery alone cannot restore an
-R2 object already deleted by compaction. Reverse migration is not implemented.
+write, rolling back to code without R2 readers is unsafe. Recovery is whole as
+long as the retention period is at least the point-in-time window you intend to
+use: SQLite point-in-time recovery alone cannot restore an R2 object that has
+already been deleted. Reverse migration is not implemented.
 
 ## Chunk garbage collection
 
@@ -109,7 +116,7 @@ Two kinds of leftovers are collected, each after its own grace period:
   marked orphans past theirs, at most `limit` (default 1000) of each per call,
   and compacts. Deleted documents leave the clients' local databases through
   replication; compaction drops their bodies and unreferences their R2
-  objects, which the next alarm deletes. The response carries what was
+  objects, which are deleted once the retention period above has passed. The response carries what was
   collected (`files` and chunk `count`/bytes), how many due items remain for a
   further call, and the status afterwards.
 

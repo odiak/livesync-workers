@@ -134,8 +134,10 @@ it("scans and collects orphaned chunks on real Durable Object SQLite", async () 
   expect((await stub.fetch("https://db/gone.md")).status).toBe(404);
   expect((await stub.fetch("https://db/h:held")).status).toBe(404);
   await runDurableObjectAlarm(stub);
+  // Collected bodies stay for the retention period (default 30 days) so point-in-time recovery stays whole.
   await runInDurableObject(stub, async (_,state) => {
-    expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM chunk_objects").one().n).toBe(1);
+    expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM chunk_objects").one().n).toBe(3);
+    expect(state.storage.sql.exec("SELECT COUNT(*) AS n FROM chunk_objects WHERE unreferenced_at IS NOT NULL").one().n).toBe(2);
   });
 });
 

@@ -266,6 +266,35 @@ try {
     await expectDeleted(reader, 'assets/original.pdf');
   });
   await step(
+    'chunk collection after deletes spares live files, survives an offline device, and a re-added file re-uploads its chunks',
+    async () => {
+      // The reader is offline while the server collects (grace periods shortened to zero for the test).
+      await reader.session.app.stop();
+      reader.session = undefined;
+      const scanned = await backend.chunkGc('a', { action: 'scan' });
+      assert.ok(scanned.status.deletedFiles.count >= 2, 'Deleted note and binary must be recorded as deleted files');
+      const collected = await backend.chunkGc('a', { action: 'collect', graceMs: 0, deletedFilesGraceMs: 0 });
+      assert.ok(collected.collected.files >= 2, 'Deleted files must be tombstoned');
+      assert.ok(collected.collected.count > 0, 'Their chunks must be collected');
+      assert.equal(collected.remaining, 0);
+      result.chunkGc = collected.collected;
+      // Live files are untouched on the writer and on the server.
+      await sync(writer);
+      await expectFile(writer, 'assets/retained.png', updated);
+      assert.equal((await backend.request('a', '/assets%2Fretained.png')).status, 200);
+      // Re-adding the deleted binary reuses chunk hashes the server just collected; LiveSync must re-upload them.
+      await write(writer, 'assets/original.pdf', original.toString('base64'), true);
+      await sync(writer);
+      assert.equal((await backend.request('a', '/assets%2Foriginal.pdf')).status, 200);
+      // The device that was offline during collection reconnects and converges.
+      await startClient('a', reader);
+      await sync(reader);
+      await expectFile(reader, 'assets/retained.png', updated);
+      await expectFile(reader, 'assets/original.pdf', original);
+      await expectDeleted(reader, '日本語.md');
+    },
+  );
+  await step(
     'SQLite/R2 persistence after compaction and Worker restart reaches fresh Obsidian without resurrection',
     async () => {
       await backend.compact('a');
@@ -273,9 +302,9 @@ try {
       const fresh = await startClient('a');
       await sync(fresh);
       await expectFile(fresh, 'assets/retained.png', updated);
+      await expectFile(fresh, 'assets/original.pdf', original);
       await expectFile(fresh, 'reconnect.md', Buffer.from('after client restart'));
       await expectDeleted(fresh, '日本語.md');
-      await expectDeleted(fresh, 'assets/original.pdf');
     },
   );
   result.status = 'passed';

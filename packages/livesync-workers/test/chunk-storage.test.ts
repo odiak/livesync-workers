@@ -4,7 +4,7 @@ import { LiveSyncVaultDO, type VaultBindings, type ChunkStorageStatus } from "..
 import { testEnv, testBindings, testHost, memoryBucket, TEST_SECRET } from "./helpers.js";
 import { INTERNAL_SECRET_HEADER } from "../src/livesync/http.js";
 
-function setup(enabled = true) {
+function setup(enabled = true, retentionMs = 0) {
   const database = new DatabaseSync(":memory:");
   let alarm: number | null = null;
   const storage = {
@@ -31,7 +31,7 @@ function setup(enabled = true) {
     list: vi.fn(async ({ prefix }: { prefix: string }) => ({ objects: [...objects.keys()].filter(k => k.startsWith(prefix)).map(key => ({ key })), truncated: false })),
   };
   const env = testEnv({ FTS_BUCKET: memoryBucket().bucket, semanticSearch: false });
-  const bindings: VaultBindings = { ...testBindings(env), chunkBucket: enabled ? bucket as unknown as R2Bucket : undefined, chunkBodyThresholdBytes: 1024 };
+  const bindings: VaultBindings = { ...testBindings(env), chunkBucket: enabled ? bucket as unknown as R2Bucket : undefined, chunkBodyThresholdBytes: 1024, chunkObjectRetentionMs: retentionMs };
   class Vault extends LiveSyncVaultDO<typeof env> {
     protected host() { return testHost(env); }
     protected bindings() { return bindings; }
@@ -145,6 +145,33 @@ describe("R2 chunk body storage", () => {
     await t.request("/internal/purge", {});
     expect([...t.objects.keys()]).toEqual(["chunks/another/vault/untouched"]);
     expect((await t.status()).r2Bytes).toBe(0);
+  });
+
+  it("keeps unreferenced bodies for the retention period so point-in-time recovery stays whole", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = Date.now();
+      const DAY = 86_400_000;
+      const t = setup(true, 30 * DAY); await t.create(); await t.put([leaf()]);
+      await t.put([{ ...leaf(), _rev: "2-b", data: "b".repeat(1200), _revisions: { start: 2, ids: ["b", "a"] } }]);
+      await t.request("/_compact", {}); await t.tick();
+      // Still there, now on the clock.
+      expect(t.objects.size).toBe(2);
+      expect(await t.status()).toMatchObject({ pendingCleanup: 1, retentionMs: 30 * DAY });
+      expect((await t.status()).pendingCleanupBytes).toBeGreaterThan(0);
+      expect(t.database.prepare("SELECT COUNT(*) AS n FROM chunk_objects WHERE unreferenced_at = ?").get(start)).toEqual({ n: 1 });
+      await t.tick();
+      expect(t.objects.size).toBe(2);
+      vi.setSystemTime(start + 29 * DAY);
+      await t.tick();
+      expect(t.objects.size).toBe(2);
+      vi.setSystemTime(start + 31 * DAY);
+      await t.tick();
+      expect(t.objects.size).toBe(1);
+      expect((await t.status()).pendingCleanup).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("serializes simultaneous writes over R2 awaits so sequence numbers remain unique", async () => {

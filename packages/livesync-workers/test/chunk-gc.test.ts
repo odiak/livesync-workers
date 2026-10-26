@@ -33,7 +33,7 @@ function setup() {
     list: vi.fn(async ({ prefix }: { prefix: string }) => ({ objects: [...objects.keys()].filter(k => k.startsWith(prefix)).map(key => ({ key })), truncated: false })),
   };
   const env = testEnv({ FTS_BUCKET: memoryBucket().bucket, semanticSearch: false });
-  const bindings: VaultBindings = { ...testBindings(env), chunkBucket: bucket as unknown as R2Bucket, chunkBodyThresholdBytes: 1024 };
+  const bindings: VaultBindings = { ...testBindings(env), chunkBucket: bucket as unknown as R2Bucket, chunkBodyThresholdBytes: 1024, chunkObjectRetentionMs: 0 };
   class Vault extends LiveSyncVaultDO<typeof env> {
     protected host() { return testHost(env); }
     protected bindings() { return bindings; }
@@ -46,7 +46,7 @@ function setup() {
   }));
   type GcResponse = { collected: { count: number; sqliteBytes: number; r2Bytes: number; files: number } | null; remaining: number; status: ChunkGcStatus };
   return {
-    database, objects, request, bindings, alarmAt: () => alarm,
+    database, objects, request, bindings, storage, alarmAt: () => alarm,
     put: (docs: unknown[]) => request("/_bulk_docs", { docs, new_edits: false }),
     status: async () => (await request("/internal/chunk-gc")).json() as Promise<ChunkGcStatus>,
     gc: async (body: Record<string, unknown>) => (await request("/internal/chunk-gc", body)).json() as Promise<GcResponse>,
@@ -180,6 +180,62 @@ describe("chunk garbage collection", () => {
     const second = await t.status();
     expect(second.lastCollect).toMatchObject({ count: 2, files: 0 });
     expect(t.alarmAt()).toBe(second.lastCollectAt! + DAY);
+  });
+
+  it("keeps chunks that only a conflicting revision of a file still references", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.now();
+    const t = setup(); await t.create();
+    // one.md has two live heads: the winner points at h:w, the losing conflict at h:l.
+    await t.put([
+      leaf("h:w", "w"), leaf("h:l", "l"), leaf("h:gone", "g"),
+      { _id: "one.md", _rev: "1-a", path: "one.md", type: "plain", children: ["h:w"] },
+      { _id: "one.md", _rev: "1-b", path: "one.md", type: "plain", children: ["h:l"] },
+    ]);
+    const status = await t.status();
+    expect(status.orphans.count).toBe(1);
+    await t.gc({ action: "scan" });
+    vi.setSystemTime(start + 8 * DAY);
+    expect((await t.gc({ action: "collect" })).collected).toMatchObject({ count: 1 });
+    expect((await t.request("/h:gone")).status).toBe(404);
+    expect((await t.request("/h:w")).status).toBe(200);
+    expect((await t.request("/h:l")).status).toBe(200);
+    // Resolving the conflict by deleting the losing head frees its chunk after the usual wait.
+    await t.request("/one.md?rev=1-b", undefined, "DELETE");
+    expect((await t.gc({ action: "scan" })).status.orphans.count).toBe(1);
+    vi.setSystemTime(start + 16 * DAY);
+    expect((await t.gc({ action: "collect" })).collected).toMatchObject({ count: 1 });
+    expect((await t.request("/h:l")).status).toBe(404);
+    expect((await t.request("/h:w")).status).toBe(200);
+  });
+
+  it("resumes cleanly after a collection fails part-way", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = Date.now();
+    const t = setup(); await t.create();
+    await t.put(Array.from({ length: 4 }, (_, i) => leaf(`h:${i}`, `${i}`)));
+    await t.gc({ action: "scan" });
+    vi.setSystemTime(start + 8 * DAY);
+    // The scan commits first, then the third tombstone's transaction blows up:
+    // two chunks are gone, two are not, and nothing was recorded as collected.
+    const real = t.storage.transactionSync.bind(t.storage);
+    let writes = 0;
+    const spy = vi.spyOn(t.storage, "transactionSync").mockImplementation(<T,>(fn: () => T): T => {
+      if (++writes === 4) throw new Error("storage hiccup");
+      return real(fn);
+    });
+    expect((await t.request("/internal/chunk-gc", { action: "collect" })).status).toBe(500);
+    spy.mockRestore();
+    const deleted = async () => (await Promise.all([0, 1, 2, 3].map(i => t.request(`/h:${i}`)))).filter(r => r.status === 404).length;
+    expect(await deleted()).toBe(2);
+    const after = await t.status();
+    expect(after.orphans.count).toBe(2);
+    expect(after.due.count).toBe(2);
+    expect(after.lastCollectAt).toBeNull();
+    // The next run picks up exactly what is left.
+    expect((await t.gc({ action: "collect" })).collected).toMatchObject({ count: 2 });
+    expect(await deleted()).toBe(4);
+    expect((await t.status()).orphans.count).toBe(0);
   });
 
   it("collects in bounded batches and refuses unknown actions", async () => {

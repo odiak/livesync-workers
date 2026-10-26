@@ -136,6 +136,13 @@ export interface VaultBindings {
   /** UTF-8 bytes of the serialized leaf revision body. Default 64 KiB. */
   chunkBodyThresholdBytes?: number;
   /**
+   * How long an R2 body is kept after nothing references it (compaction,
+   * chunk collection). Default 30 days, the window of Durable Object
+   * point-in-time recovery, so a restored database still finds its bodies.
+   * 0 deletes on the next maintenance pass.
+   */
+  chunkObjectRetentionMs?: number;
+  /**
    * Vector index for semantic search. Leave `vectorize` and `embedder` both
    * unset to run without semantic search: notes are still tracked and the
    * full-text index still works, `Vault.search` returns no hits, and nothing

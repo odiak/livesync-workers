@@ -140,7 +140,15 @@ export async function startBackend() {
     async compact(vaultId) {
       const response = await this.request(vaultId, '/_compact', { method: 'POST' });
       if (response.status !== 202) throw new Error('Background compaction was not accepted');
-
+    },
+    async chunkGc(vaultId, body) {
+      const response = await fetch(`${origin}/e2e/chunk-gc?vault=${vaultId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(`Chunk GC ${body.action} failed: ${response.status}`);
+      return response.json();
     },
     async pause() {
       await stop();
