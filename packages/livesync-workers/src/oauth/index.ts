@@ -29,6 +29,13 @@ export type OAuthPrincipal = {
 export type VaultOAuthOptions<Env> = {
   /** Path the MCP endpoint is served under. Default "/mcp". */
   apiRoute?: string;
+  /**
+   * Canonical URL of the MCP endpoint; every token is bound to it. Omit to
+   * use the request's origin plus `apiRoute`, which is also what OAuth
+   * Provider 0.x advertised, so grants issued before 1.x keep refreshing.
+   * Set it only when clients reach the endpoint under one fixed URL.
+   */
+  resource?: string;
   /** Handler for `apiRoute`, e.g. `MyMcp.serve("/mcp")`. Receives `ctx.props`. */
   apiHandler: ExportedHandler<Env>;
   /** Everything else (your app). */
@@ -76,6 +83,8 @@ type ProviderEnv = {
 };
 
 const CSRF_COOKIE = "ls_oauth_csrf";
+/** Distinct hostnames a Worker is expected to answer on; a safety bound only. */
+const MAX_RESOURCES = 16;
 
 export function escapeHtml(value: string): string {
   return value.replace(
@@ -303,34 +312,56 @@ function consentHandler<Env>(options: VaultOAuthOptions<Env>): ExportedHandler<E
  * Requires a KV binding named `OAUTH_KV`.
  */
 export function createVaultOAuthProvider<Env>(options: VaultOAuthOptions<Env>) {
+  const apiRoute = options.apiRoute ?? "/mcp";
   const scopesSupported = options.scopes.map((s) => s.name);
-  const provider = new OAuthProvider({
-    apiRoute: options.apiRoute ?? "/mcp",
-    apiHandler: options.apiHandler as never,
-    defaultHandler: consentHandler(options) as never,
-    authorizeEndpoint: "/authorize",
-    tokenEndpoint: "/token",
-    clientRegistrationEndpoint: "/register",
-    scopesSupported,
-    accessTokenTTL: options.accessTokenTTL ?? 60 * 60,
-    refreshTokenTTL: options.refreshTokenTTL === null ? undefined : options.refreshTokenTTL ?? 60 * 60 * 24 * 30,
-    allowPlainPKCE: false,
-    tokenExchangeCallback: ({ props, requestedScope }) => ({
-      accessTokenProps: { ...props, scope: requestedScope },
-    }),
-    resourceMetadata: { resource_name: options.resourceName, scopes_supported: scopesSupported },
-  });
-  const fetch = provider.fetch.bind(provider);
-  provider.fetch = async (request, env, ctx) => {
-    try {
-      if (["/authorize", "/register", "/token"].includes(new URL(request.url).pathname) && request.body) {
-        request = new Request(request, { body: await readBoundedText(request, 64 * 1024) });
-      }
-      return await fetch(request, env, ctx);
-    } catch (error) {
-      if (error instanceof RequestLimitError) return new Response(error.message, { status: 413 });
-      throw error;
+  const build = (resource: string) =>
+    new OAuthProvider({
+      apiRoute,
+      apiHandler: options.apiHandler as never,
+      defaultHandler: consentHandler(options) as never,
+      authorizeEndpoint: "/authorize",
+      tokenEndpoint: "/token",
+      clientRegistrationEndpoint: "/register",
+      scopesSupported,
+      accessTokenTTL: options.accessTokenTTL ?? 60 * 60,
+      refreshTokenTTL:
+        options.refreshTokenTTL === null ? undefined : options.refreshTokenTTL ?? 60 * 60 * 24 * 30,
+      tokenExchangeCallback: ({ props, requestedScope }) => ({
+        accessTokenProps: { ...props, scope: requestedScope },
+      }),
+      resourceMetadata: { resource, resource_name: options.resourceName },
+      // Advertised in the resource metadata and the 401 challenge, as
+      // scopes_supported was before 1.x; the consent page picks what is granted.
+      requiredScopes: scopesSupported,
+    });
+
+  // One provider per resource: a Worker reachable under several hostnames
+  // (custom domain and workers.dev) binds each grant to the one it was used on.
+  const providers = new Map<string, OAuthProvider<Env>>();
+  const providerFor = (request: Request) => {
+    const resource = options.resource ?? `${new URL(request.url).origin}${apiRoute}`;
+    let provider = providers.get(resource);
+    if (!provider) {
+      if (providers.size >= MAX_RESOURCES) providers.clear();
+      provider = build(resource) as unknown as OAuthProvider<Env>;
+      providers.set(resource, provider);
     }
+    return provider;
   };
-  return provider;
+  // Fail at startup, not on the first request, when a fixed resource is invalid.
+  if (options.resource) providerFor(new Request(options.resource));
+
+  return {
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+      try {
+        if (["/authorize", "/register", "/token"].includes(new URL(request.url).pathname) && request.body) {
+          request = new Request(request, { body: await readBoundedText(request, 64 * 1024) });
+        }
+        return await providerFor(request).fetch(request, env as never, ctx);
+      } catch (error) {
+        if (error instanceof RequestLimitError) return new Response(error.message, { status: 413 });
+        throw error;
+      }
+    },
+  };
 }

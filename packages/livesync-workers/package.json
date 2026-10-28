@@ -1,6 +1,6 @@
 {
   "name": "livesync-workers",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Self-hosted LiveSync-compatible backend for Obsidian with search and MCP, for Cloudflare Workers",
   "license": "MIT",
   "type": "module",
@@ -43,7 +43,7 @@
     "prepack": "node scripts/prepack-readme.mjs"
   },
   "peerDependencies": {
-    "@cloudflare/workers-oauth-provider": ">=0.2.0",
+    "@cloudflare/workers-oauth-provider": ">=1.2.4",
     "@modelcontextprotocol/sdk": ">=1.23.0",
     "zod": "^3.25.0 || ^4.0.0"
   },
@@ -59,7 +59,7 @@
     }
   },
   "devDependencies": {
-    "@cloudflare/workers-oauth-provider": "0.10.4",
+    "@cloudflare/workers-oauth-provider": "1.2.4",
     "@cloudflare/workers-types": "5.20261027.1",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/node": "24.19.2",

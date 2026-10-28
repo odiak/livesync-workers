@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createVaultOAuthProvider } from "../src/oauth/index.js";
+import { createVaultOAuthProvider, type VaultOAuthOptions } from "../src/oauth/index.js";
 
-function setup(refreshTokenTTL?: number | null) {
+function setup(refreshTokenTTL?: number | null, extra: Partial<VaultOAuthOptions<unknown>> = {}) {
   const store = new Map<string, string>();
   const kv = {
     async get(key: string, options?: { type?: string }) {
@@ -23,6 +23,7 @@ function setup(refreshTokenTTL?: number | null) {
     loginRedirect: () => new Response("login", { status: 401 }),
     scopes: [{ name: "vault:read", description: "read", required: true }, { name: "vault:write", description: "write" }],
     csrfSecret: () => "test-secret", resourceName: "Vault",
+    ...extra,
   });
   const ctx = { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext;
   const fetch = (request: Request) => provider.fetch(request, env, { ...ctx });
@@ -143,5 +144,40 @@ describe("OAuth refresh token lifetime", () => {
     }));
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: "invalid_grant" });
+  });
+});
+
+describe("OAuth protected resource", () => {
+  it("advertises the MCP URL on the request's origin, as OAuth Provider 0.x did", async () => {
+    const { fetch } = setup();
+    const challenge = await fetch(new Request(`${origin}/mcp`));
+    expect(challenge.status).toBe(401);
+    expect(challenge.headers.get("WWW-Authenticate")).toContain(
+      `resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+    );
+    const metadata = await fetch(new Request(`${origin}/.well-known/oauth-protected-resource/mcp`));
+    expect(await metadata.json()).toMatchObject({
+      resource: `${origin}/mcp`,
+      resource_name: "Vault",
+      scopes_supported: ["vault:read", "vault:write"],
+    });
+  });
+
+  it("binds a token to the hostname it was issued on", async () => {
+    const { fetch } = setup();
+    const { clientId, code } = await authorize(fetch);
+    const issued = await token(fetch, {
+      grant_type: "authorization_code", client_id: clientId, code, code_verifier: verifier, redirect_uri: callback,
+      resource: `${origin}/mcp`,
+    });
+    expect((await apiProps(fetch, issued.access_token)).userId).toBe("A");
+    const elsewhere = await fetch(new Request("https://other.example/mcp", {
+      headers: { Authorization: `Bearer ${issued.access_token}` },
+    }));
+    expect(elsewhere.status).toBe(401);
+  });
+
+  it("rejects a fixed resource that is not HTTPS at construction", () => {
+    expect(() => setup(undefined, { resource: "http://vault.example/mcp" })).toThrow();
   });
 });

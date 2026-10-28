@@ -10,7 +10,7 @@ can host many vaults with its own user management.
 |---|---|
 | `livesync-workers` | `LiveSyncVaultDO` (Durable Object base class), `handleLiveSyncRequest`, `createVault`, types, helpers |
 | `livesync-workers/mcp` | `registerVaultTools(server, ctx)` and the vault scope constants (peer: `@modelcontextprotocol/sdk`, `zod`) |
-| `livesync-workers/oauth` | `createVaultOAuthProvider` (peer: `@cloudflare/workers-oauth-provider`) |
+| `livesync-workers/oauth` | `createVaultOAuthProvider` (peer: `@cloudflare/workers-oauth-provider` 1.2.4 or later) |
 
 ## 1. Implement `VaultHost`
 
@@ -157,3 +157,9 @@ with any of your own. To offer a subset per user (a plan or feature flag),
 return `scopes: [...]` from `authenticate`; the consent page shows only those
 (plus required scopes) and the submitted form is validated against the same
 list.
+
+Every token is bound to the MCP endpoint's URL. By default that is the
+request's origin plus `apiRoute` (`https://your.host/mcp`), the value OAuth
+Provider 0.x advertised, so grants issued before upgrading keep refreshing.
+Set `resource` only when clients always reach the endpoint under one URL;
+a grant bound to any other value makes its client sign in again.
