@@ -181,3 +181,30 @@ describe("OAuth protected resource", () => {
     expect(() => setup(undefined, { resource: "http://vault.example/mcp" })).toThrow();
   });
 });
+
+
+describe("OAuth HTTP redirects", () => {
+  it.each(["GET", "HEAD"])("redirects HTTP %s before constructing the OAuth provider", async (method) => {
+    const { fetch } = setup();
+    const response = await fetch(new Request("http://vault.example/", { method }));
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe("https://vault.example/");
+  });
+
+  it("preserves the path and query string", async () => {
+    const { fetch } = setup();
+    const response = await fetch(new Request("http://vault.example/authorize?client_id=test&state=a%2Fb"));
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe("https://vault.example/authorize?client_id=test&state=a%2Fb");
+  });
+
+  it.each(["http://localhost:8787", "http://127.0.0.1:8787", "http://127.0.0.2:8787", "http://[::1]:8787", origin])(
+    "serves %s without redirecting",
+    async (base) => {
+      const { fetch } = setup();
+      const response = await fetch(new Request(`${base}/`));
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("app");
+    },
+  );
+});

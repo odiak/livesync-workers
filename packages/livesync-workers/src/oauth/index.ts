@@ -354,7 +354,15 @@ export function createVaultOAuthProvider<Env>(options: VaultOAuthOptions<Env>) {
   return {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
       try {
-        if (["/authorize", "/register", "/token"].includes(new URL(request.url).pathname) && request.body) {
+        const url = new URL(request.url);
+        // OAuth resource URLs require HTTPS, except on loopback hosts for local dev.
+        const isLoopback = url.hostname === "localhost" || url.hostname === "[::1]" ||
+          /^127\.\d+\.\d+\.\d+$/.test(url.hostname);
+        if (url.protocol === "http:" && !isLoopback) {
+          url.protocol = "https:";
+          return Response.redirect(url.toString(), 301);
+        }
+        if (["/authorize", "/register", "/token"].includes(url.pathname) && request.body) {
           request = new Request(request, { body: await readBoundedText(request, 64 * 1024) });
         }
         return await providerFor(request).fetch(request, env as never, ctx);
