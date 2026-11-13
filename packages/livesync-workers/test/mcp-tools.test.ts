@@ -55,7 +55,7 @@ describe("MCP note-read response compatibility", () => {
             name,
             arguments: name === "readNote" ? { path } : { date: "2026-11-13" },
           });
-          expect(result.isError).not.toBe(true);
+          expect(result.isError ?? false).toBe(body === null);
           const blocks = result.content as Array<{ type: string; text: string }>;
           expect(blocks).toHaveLength(1);
           expect(blocks[0]!.type).toBe("text");

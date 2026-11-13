@@ -55,6 +55,7 @@ export function vaultInstructions(options: VaultInstructionsOptions = {}): strin
 
 function textResult(value: unknown) {
   return {
+    ...(value != null && typeof value === "object" && "error" in value ? { isError: true } : {}),
     content: [
       {
         type: "text" as const,
