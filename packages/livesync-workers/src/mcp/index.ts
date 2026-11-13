@@ -165,7 +165,7 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
 
   server.tool(
     "readNote",
-    "Read a Markdown note by vault-relative path.",
+    "Read a Markdown note by vault-relative path. Returns the note body in text.",
     {
       path: z.string().min(1).describe("Vault-relative Markdown path, e.g. Projects/Plan.md"),
     },
@@ -182,7 +182,8 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
       }
       return textResult({
         path,
-        content,
+        // Avoid a nested content key: ChatGPT can drop the entire JSON text result.
+        text: content,
         // Pass back to writeNote as expectedContentHash when overwriting.
         contentHash: await hashText(content),
       });
@@ -252,7 +253,7 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
 
   server.tool(
     "readDailyNote",
-    "Read a daily note by date using Obsidian daily-notes settings when available.",
+    "Read a daily note by date using Obsidian daily-notes settings when available. Returns the note body in text.",
     {
       date: z
         .string()
@@ -268,7 +269,7 @@ export function registerVaultTools(server: McpServer, ctx: VaultToolContext): vo
       const path = inferDailyNotePath(paths, date, settings);
       const content = await vault.readNote(path);
       if (content == null) return textResult({ error: "NOT_FOUND", date, path });
-      return textResult({ date, path, content, contentHash: await hashText(content) });
+      return textResult({ date, path, text: content, contentHash: await hashText(content) });
     },
   );
 

@@ -99,6 +99,10 @@ New MCP OAuth connections have no expiry (access tokens still expire after one h
 
 Clients that cannot do OAuth can send `Authorization: Bearer <MCP_STATIC_TOKEN>` instead once you add that secret (`wrangler secret put MCP_STATIC_TOKEN`, or in the dashboard under Settings → Variables and Secrets). The token grants `vault:read` only; add `vault:append` and/or `vault:write` through the `MCP_STATIC_TOKEN_SCOPES` variable. Tools apply the same scope checks as for OAuth grants.
 
+### MCP note-read response compatibility
+
+`readNote` and `readDailyNote` return the note body under `text` (formerly `content`) in their JSON text result. `path`, `date` (daily notes), and `contentHash` are unchanged. This avoids a ChatGPT issue that can turn JSON text results containing a `content` key into `{}`. Clients that parse the inner JSON must use `text`. The MCP content-block envelope, `writeNote` input, and the Vault API are unchanged.
+
 ## Configuration
 
 Variables (in `wrangler.jsonc` `vars`, editable in the dashboard; `keep_vars` is on, so variables added in the dashboard survive deploys):
