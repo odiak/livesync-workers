@@ -163,3 +163,20 @@ request's origin plus `apiRoute` (`https://your.host/mcp`), the value OAuth
 Provider 0.x advertised, so grants issued before upgrading keep refreshing.
 Set `resource` only when clients always reach the endpoint under one URL;
 a grant bound to any other value makes its client sign in again.
+
+## EmbeddingGemma 2 migration
+
+The default `workersAiEmbedder` uses `@cf/google/embeddinggemma-2` (768 dimensions),
+including the model's document/query task prefixes and `input`/`data[].embedding`
+API schema. Existing 768-dimensional cosine indexes can be reused.
+
+On a vault's next request or alarm, an embedding version change queues every note
+for re-embedding in the existing bounded background passes. Note content, LiveSync
+revisions and full-text hashes are preserved. Semantic search omits vectors from
+the previous model, so results can be incomplete until re-embedding finishes.
+`indexStatus()` reports `embeddingVersion` and the existing `pending` count.
+
+Custom embedders can set `indexVersion` to opt into this migration and metadata
+validation. `embed(texts, "query")` identifies search queries; omitted purpose
+means documents. Existing single-argument embedders remain supported. Passing
+another Workers AI model explicitly retains the legacy `text`/`data` schema.

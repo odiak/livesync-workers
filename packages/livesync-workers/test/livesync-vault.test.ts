@@ -575,14 +575,31 @@ describe("LiveSync Vectorize indexing", () => {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
     await durableObject.alarm();
     expect(env.AI.run).toHaveBeenCalledTimes(1);
-    const inputs = env.AI.run.mock.calls.flatMap((call) => (call[1] as { text: string[] }).text);
+    const inputs = env.AI.run.mock.calls.flatMap((call) => (call[1] as { input: string[] }).input);
     expect(inputs).toHaveLength(2);
     expect(inputs.some((text) => text.includes("tailneedle"))).toBe(true);
-    expect(inputs.every((text) => text.length <= 4_000)).toBe(true);
+    expect(inputs.every((text) => text.length <= 4_000 + "title: none | text: ".length)).toBe(true);
     expect(storage.sql.exec("SELECT value FROM meta WHERE key = 'index_version'").one())
       .toEqual({ value: "3" });
     await durableObject.alarm();
     expect(env.AI.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-embeds unchanged notes from the old model once and preserves full-text hashes", async () => {
+    const { durableObject, storage, env, upserted } = await created();
+    await replicate(durableObject, [noteDoc("a.md", "1-a", "a.md", [], { data: "unchanged" })]);
+    await durableObject.alarm();
+    storage.sql.exec(`UPDATE meta SET value = 'old-model' WHERE key = 'embedding_version'`);
+    storage.sql.exec(`UPDATE index_state SET fts_hash = 'full-text-hash', attempts = 25`);
+    const seq = storage.sql.exec(`SELECT value FROM meta WHERE key = 'seq'`).toArray();
+    await durableObject.alarm();
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
+    expect(upserted.at(-1)?.metadata?.embeddingVersion).toBe("@cf/google/embeddinggemma-2");
+    expect(storage.sql.exec(`SELECT fts_hash, pending, attempts FROM index_state`).one())
+      .toEqual({ fts_hash: "full-text-hash", pending: 0, attempts: 0 });
+    expect(storage.sql.exec(`SELECT value FROM meta WHERE key = 'seq'`).toArray()).toEqual(seq);
+    await durableObject.alarm();
+    expect(env.AI.run).toHaveBeenCalledTimes(2);
   });
 
   it("re-embeds every note once when the index version changes", async () => {
@@ -1056,10 +1073,10 @@ describe("LiveSync Vectorize indexing", () => {
     let entered!: () => void;
     const paused = new Promise<void>((resolve) => { entered = resolve; });
     const gate = new Promise<void>((resolve) => { resume = resolve; });
-    env.AI.run.mockImplementationOnce(async (_model: string, input: { text: string[] }) => {
+    env.AI.run.mockImplementationOnce(async (_model: string, input: { input: string[] }) => {
       entered();
       await gate;
-      return { data: input.text.map(() => [1, 2]) };
+      return { data: input.input.map((_, index) => ({ index, embedding: [1, 2] })) };
     });
     const indexing = durableObject.alarm();
     await paused;

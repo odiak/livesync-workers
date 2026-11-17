@@ -765,7 +765,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     if (
       Date.now() - this.lastIndexScheduleAt > 5_000 &&
       this.dbExists() &&
-      (this.indexNeedsVersionUpgrade() ||
+      (this.indexNeedsVersionUpgrade() || this.embeddingNeedsVersionUpgrade() ||
         this.indexedSeq() < this.currentSeq() ||
         this.hasFullTextBacklog() ||
         this.first(`SELECT 1 FROM index_state WHERE pending = 1 AND attempts < ? LIMIT 1`, INDEX_MAX_ATTEMPTS) != null ||
@@ -1021,6 +1021,7 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
                 },
               }
             : {}),
+          embeddingVersion: this.getMeta("embedding_version"),
           indexedSeq: this.indexedSeq(),
           currentSeq: this.currentSeq(),
           indexed: this.first<{ count: number }>(
@@ -1352,6 +1353,12 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     return this.getMeta(INDEX_VERSION_META_KEY) !== CURRENT_INDEX_VERSION;
   }
 
+  private embeddingNeedsVersionUpgrade(): boolean {
+    const { vectorize, embedder } = this.bindings();
+    return Boolean(vectorize && embedder?.indexVersion &&
+      this.getMeta("embedding_version") !== embedder.indexVersion);
+  }
+
   private async runIndexing(): Promise<{ more: boolean; retry: boolean; worked: boolean }> {
     const started = Date.now();
     const ref = this.vaultRef();
@@ -1384,6 +1391,11 @@ export abstract class LiveSyncVaultDO<TEnv = unknown> {
     let cacheReads = 0;
     let preparationLimit = false;
     const prepared = await this.withExclusive(async () => {
+      if (this.embeddingNeedsVersionUpgrade()) {
+        this.ctx.storage.sql.exec(`UPDATE index_state SET hash = NULL, pending = 1, attempts = 0`);
+        this.setMeta(INDEXED_SEQ_META_KEY, "0");
+        this.setMeta("embedding_version", this.bindings().embedder!.indexVersion!);
+      }
       if (this.indexNeedsVersionUpgrade()) {
         this.ctx.storage.sql.exec(`UPDATE index_state SET hash = NULL`);
         this.setMeta(INDEXED_SEQ_META_KEY, "0");

@@ -39,6 +39,8 @@ export type VaultNoteStat = {
 };
 
 export type VaultIndexStatus = {
+  /** Model version being indexed; pending notes may still need re-embedding. */
+  embeddingVersion?: string | null;
   indexedSeq: number;
   currentSeq: number;
   indexed: number;

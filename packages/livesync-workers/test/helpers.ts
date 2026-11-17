@@ -30,8 +30,8 @@ export function testEnv(overrides: Partial<TestEnv> = {}): TestEnv {
   return {
     policy: { ...DEFAULT_VAULT_POLICY },
     AI: {
-      run: vi.fn(async (_model: string, input: { text: string[] }) => ({
-        data: input.text.map((_, index) => [index, 1]),
+      run: vi.fn(async (_model: string, input: { input: string[] }) => ({
+        data: input.input.map((_, index) => ({ index, embedding: [index, 1] })),
       })),
     },
     VECTORIZE: {

@@ -44,7 +44,7 @@
   "cloudflare": {
     "bindings": {
       "VECTORIZE": {
-        "description": "Semantic search index. Enter **768** dimensions and **cosine** metric: the embedding model (Workers AI `@cf/google/embeddinggemma-300m`) requires them."
+        "description": "Semantic search index. Enter **768** dimensions and **cosine** metric: the embedding model (Workers AI `@cf/google/embeddinggemma-2`) requires them."
       },
       "FTS_BUCKET": {
         "description": "Stores the full-text search index. Any bucket name works."

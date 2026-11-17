@@ -109,7 +109,9 @@ export interface FullTextIndex {
 
 /** Text embedding provider for semantic search. */
 export interface Embedder {
-  embed(texts: string[]): Promise<number[][]>;
+  /** Change when vectors become incompatible. Existing notes are re-embedded on next access/alarm. */
+  indexVersion?: string;
+  embed(texts: string[], purpose?: "document" | "query"): Promise<number[][]>;
 }
 
 /**

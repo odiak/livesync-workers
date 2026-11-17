@@ -23,7 +23,7 @@ function wrangler(args, { allowExisting = true } = {}) {
   }
 }
 
-// Dimensions must match the embedding model (embeddinggemma-300m → 768).
+// Dimensions must match the embedding model (embeddinggemma-2 → 768).
 wrangler(["vectorize", "create", indexName, "--dimensions=768", "--metric=cosine"]);
 wrangler(["r2", "bucket", "create", bucketName]);
 

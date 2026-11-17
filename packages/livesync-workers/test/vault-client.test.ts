@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createVault, type VaultBindings } from "../src/index.js";
+import { createVault, DEFAULT_WORKERS_AI_EMBEDDING_MODEL, type VaultBindings } from "../src/index.js";
 import { memoryBucket, testBindings, testEnv, TEST_SECRET } from "./helpers.js";
 import { appendFtsSegment } from "../src/search/fts-index.js";
 import { hashText } from "../src/search/chunk-md.js";
@@ -7,11 +7,11 @@ import { isReservedPath } from "../src/types.js";
 
 function vaultWith(
   response: Response | Response[],
-  options: { searchHits?: unknown[]; restricted?: boolean } = {},
+  options: { searchHits?: Record<string, unknown>[]; restricted?: boolean } = {},
 ) {
   const env = testEnv();
   env.VECTORIZE.query.mockImplementation(async () => ({
-    matches: (options.searchHits ?? []).map((hit) => ({ score: 1, metadata: hit })),
+    matches: (options.searchHits ?? []).map((hit) => ({ score: 1, metadata: { embeddingVersion: DEFAULT_WORKERS_AI_EMBEDDING_MODEL, ...hit } })),
   }));
   const responses = Array.isArray(response) ? [...response] : [response];
   const fetch = vi.fn(async (_request: Request) => responses.shift() ?? Response.json({}));
@@ -218,6 +218,7 @@ describe("Vault search freshness", () => {
     const { vault, fetch } = vaultWith(Response.json({ contents: {
       "gone.md": null, "updated.md": "current", "live.md": "live",
     } }), { searchHits: [
+      { path: "old-model.md", embeddingVersion: "old-model", preview: "old model" },
       { path: "gone.md", hash: await hashText("gone"), preview: "gone" },
       { path: "updated.md", hash: await hashText("old"), preview: "old" },
       { path: "updated.md", hash: await hashText("current"), preview: "current" },

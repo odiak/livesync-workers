@@ -78,6 +78,7 @@ export async function upsertNoteVectors(
           userId: ref.tenantId,
           vaultId: ref.databaseName,
           origin: "vault",
+          ...(bindings.embedder.indexVersion ? { embeddingVersion: bindings.embedder.indexVersion } : {}),
           path,
           mtime,
           hash,
@@ -117,7 +118,7 @@ export async function vectorSearch(
   validate?: (candidates: Array<{ path: string; hash: string | null }>) => Promise<boolean[]>,
 ): Promise<VectorSearchHit[]> {
   if (!semanticSearchEnabled(bindings)) return [];
-  const [qvec] = await bindings.embedder.embed([query.slice(0, EMBED_INPUT_MAX_CHARS)]);
+  const [qvec] = await bindings.embedder.embed([query.slice(0, EMBED_INPUT_MAX_CHARS)], "query");
   const namespaced = isolation(bindings) === "namespace";
   // Metadata mode over-fetches: the default namespace may hold other vectors
   // (e.g. a host's memory store), dropped below (returnMetadata "all" caps topK at 20).
@@ -131,6 +132,7 @@ export async function vectorSearch(
   const matches = res.matches
     .filter((m) => {
       const md = m.metadata ?? {};
+      if (bindings.embedder.indexVersion && md.embeddingVersion !== bindings.embedder.indexVersion) return false;
       if (namespaced) return true;
       if (md.origin != null && md.origin !== "vault") return false;
       return md.vaultId == null || md.vaultId === ref.databaseName;
